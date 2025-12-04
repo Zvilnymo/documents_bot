@@ -662,9 +662,10 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE, force_new_message=False):
     query = update.callback_query
-    user_id = update.effective_user.id
 
-    client = db.get_client_by_telegram_id(user_id)
+    # Використовуємо get_active_client для підтримки адмін-режиму
+    client, admin_id = get_active_client(update, context)
+
     if not client:
         message = "❌ Ви ще не зареєстровані. Натисніть /start"
         if query:
@@ -793,8 +794,8 @@ async def handle_upload_request(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений (только для пароля ЕЦП)"""
-    user_id = update.effective_user.id
-    client = db.get_client_by_telegram_id(user_id)
+    # Використовуємо get_active_client для підтримки адмін-режиму
+    client, admin_id = get_active_client(update, context)
 
     if not client:
         await update.message.reply_text("❌ Ви ще не зареєстровані. Натисніть /start")
@@ -1012,8 +1013,8 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = update.effective_user.id
-    client = db.get_client_by_telegram_id(user_id)
+    # Використовуємо get_active_client для підтримки адмін-режиму
+    client, admin_id = get_active_client(update, context)
 
     if 'uploading_doc_type' not in context.user_data:
         await query.edit_message_text("⚠️ Немає активного завантаження")
