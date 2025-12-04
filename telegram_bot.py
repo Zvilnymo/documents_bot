@@ -23,6 +23,7 @@ from psycopg2.extras import RealDictCursor
 
 # Google Drive
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 
@@ -48,6 +49,7 @@ ROOT_FOLDER_ID = os.getenv('ROOT_FOLDER_ID')
 GOOGLE_CREDENTIALS_FILE = os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json')
 GOOGLE_CREDENTIALS_BASE64 = os.getenv('GOOGLE_CREDENTIALS_BASE64')
 DRIVE_OWNER_EMAIL = os.getenv('DRIVE_OWNER_EMAIL')  # Email владельца Drive (ваш Gmail)
+GOOGLE_OAUTH_TOKEN = os.getenv('GOOGLE_OAUTH_TOKEN')  # OAuth токен (JSON string)
 
 # Settings
 REMINDER_DAYS = int(os.getenv('REMINDER_DAYS', 3))
@@ -86,7 +88,8 @@ DOCUMENT_TYPES = {
     },
     'registration': {
         'name': 'Витяг з реєстру територіальної громади',
-        'short': 'Довідка про склад сім\'ї',
+        'short': 'Склад сім\'ї',
+        'description': 'Довідка про склад сім\'ї (витяг з реєстру територіальної громади)',
         'emoji': '🏠',
         'folder': 'personal',
         'required': True
@@ -315,8 +318,20 @@ class Database:
 class DriveManager:
     def __init__(self):
         try:
-            if GOOGLE_CREDENTIALS_BASE64:
-                logger.info("Using base64 credentials from environment")
+            # Приоритет: OAuth > Service Account
+            if GOOGLE_OAUTH_TOKEN:
+                logger.info("Using OAuth 2.0 credentials")
+                token_data = json.loads(GOOGLE_OAUTH_TOKEN)
+                credentials = Credentials(
+                    token=token_data.get('token'),
+                    refresh_token=token_data.get('refresh_token'),
+                    token_uri=token_data.get('token_uri'),
+                    client_id=token_data.get('client_id'),
+                    client_secret=token_data.get('client_secret'),
+                    scopes=token_data.get('scopes')
+                )
+            elif GOOGLE_CREDENTIALS_BASE64:
+                logger.info("Using base64 Service Account credentials")
                 creds_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64)
                 creds_dict = json.loads(creds_json)
                 credentials = service_account.Credentials.from_service_account_info(
@@ -324,7 +339,7 @@ class DriveManager:
                     scopes=['https://www.googleapis.com/auth/drive']
                 )
             else:
-                logger.info(f"Using credentials file: {GOOGLE_CREDENTIALS_FILE}")
+                logger.info(f"Using Service Account credentials file: {GOOGLE_CREDENTIALS_FILE}")
                 credentials = service_account.Credentials.from_service_account_file(
                     GOOGLE_CREDENTIALS_FILE,
                     scopes=['https://www.googleapis.com/auth/drive']
@@ -347,24 +362,6 @@ class DriveManager:
             body=file_metadata,
             fields='id, webViewLink'
         ).execute()
-
-        # Передаём владение папкой владельцу Drive, чтобы использовать его квоту
-        if DRIVE_OWNER_EMAIL:
-            try:
-                permission = {
-                    'type': 'user',
-                    'role': 'owner',
-                    'emailAddress': DRIVE_OWNER_EMAIL
-                }
-                self.service.permissions().create(
-                    fileId=folder['id'],
-                    body=permission,
-                    transferOwnership=True
-                ).execute()
-                logger.info(f"Transferred ownership of folder '{name}' to {DRIVE_OWNER_EMAIL}")
-            except Exception as e:
-                logger.warning(f"Failed to transfer ownership: {e}")
-
         logger.info(f"Created folder: {name}")
         return folder
 
@@ -738,7 +735,9 @@ async def handle_upload_request(update: Update, context: ContextTypes.DEFAULT_TY
             ]])
         )
     else:
-        message = f"{doc_info['emoji']} <b>{doc_info['name']}</b>\n\n"
+        # Используем description если есть, иначе name
+        doc_title = doc_info.get('description', doc_info['name'])
+        message = f"{doc_info['emoji']} <b>{doc_title}</b>\n\n"
         if doc_info.get('multiple'):
             message += (
                 f"📎 Надішліть файл(и) документів.\n"
