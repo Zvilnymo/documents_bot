@@ -833,9 +833,11 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             existing_count = result[0]['count'] if result else 0
             file_number = existing_count + 1
             new_file_name = f"{doc_type_name}_{short_name}_{file_number}{file_ext}"
+            logger.info(f"File numbering: client_id={client['id']}, doc_type={doc_key}, existing_count={existing_count}, new_number={file_number}, new_name={new_file_name}")
         else:
             # Для одиночных файлов без номера
             new_file_name = f"{doc_type_name}_{short_name}{file_ext}"
+            logger.info(f"Single file (no number): new_name={new_file_name}")
 
         tg_file = await context.bot.get_file(file.file_id)
         temp_path = os.path.join(tempfile.gettempdir(), original_file_name)
@@ -920,9 +922,11 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Пароль ЕЦП
     if doc_info.get('is_text'):
         password = context.user_data.get('ec_password')
+        logger.info(f"ECP password from context: {password}, client_id={client['id']}")
         if password:
             try:
                 # Сохраняем пароль в БД
+                logger.info(f"Calling db.save_ec_password for client_id={client['id']}")
                 password_id = db.save_ec_password(client['id'], password)
                 logger.info(f"ECP password saved to DB: password_id={password_id}, client_id={client['id']}")
 
@@ -930,13 +934,15 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 folders = drive.create_client_folder_structure(client['full_name'], client['phone'])
                 personal_folder_id = folders['personal']['id']
                 drive.create_text_file(password, 'Пароль_ЕЦП.txt', personal_folder_id)
+                logger.info(f"ECP password file created on Drive for client_id={client['id']}")
 
                 db.update_last_activity(client['id'])
                 message = f"✅ Пароль від ЕЦП збережено!"
             except Exception as e:
-                logger.error(f"Error saving ECP password: {e}")
+                logger.error(f"Error saving ECP password: {e}", exc_info=True)
                 message = f"❌ Помилка збереження пароля: {str(e)}"
         else:
+            logger.warning(f"No ECP password in context for client_id={client['id']}")
             message = "⚠️ Ви не надіслали пароль. Спробуйте ще раз."
             context.user_data.pop('uploading_doc_type', None)
             await query.edit_message_text(message)
@@ -994,13 +1000,10 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отправляем итоговое сообщение
     await query.edit_message_text(message, parse_mode='HTML')
 
-    # Возвращаем главное меню с кнопкой
+    # Показываем чеклист автоматически
     import asyncio
-    await asyncio.sleep(1)
-    await update.effective_chat.send_message(
-        "👇 Оберіть дію:",
-        reply_markup=get_main_keyboard()
-    )
+    await asyncio.sleep(0.5)
+    await show_checklist(update, context)
 
 async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
