@@ -9,6 +9,8 @@ import base64
 import json
 from datetime import datetime, timedelta
 from io import BytesIO
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Telegram
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -824,29 +826,48 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if update.message.document:
         file = update.message.document
-        file_name = file.file_name
+        original_file_name = file.file_name
     else:
         file = update.message.photo[-1]
-        file_name = f"photo_{file.file_id}.jpg"
+        original_file_name = f"photo_{file.file_id}.jpg"
 
-    # Показываем сообщение о загрузке
-    loading_msg = await update.message.reply_text("⏳ Очікуйте, завантажуємо документи...")
+    # Показываем сообщение о загрузке только для первого файла
+    if 'uploaded_files' not in context.user_data or len(context.user_data['uploaded_files']) == 0:
+        loading_msg = await update.message.reply_text("⏳ Очікуйте, завантажуємо документи...")
+    else:
+        loading_msg = None
 
     try:
+        # Получаем расширение файла
+        file_ext = os.path.splitext(original_file_name)[1]
+
+        # Создаём новое имя файла: ТипДокумента_Имя_Фамилия.расширение
+        doc_type_name = doc_info.get('short', doc_info['name']).replace('/', '_').replace('\\', '_')
+        client_name_parts = client['full_name'].split()
+        if len(client_name_parts) >= 2:
+            # Имя Фамилия (первые 2 слова)
+            short_name = f"{client_name_parts[0]}_{client_name_parts[1]}"
+        else:
+            short_name = client['full_name'].replace(' ', '_')
+
+        # Новое имя: Паспорт_Іван_Іваненко.pdf
+        new_file_name = f"{doc_type_name}_{short_name}{file_ext}"
+
         tg_file = await context.bot.get_file(file.file_id)
-        temp_path = os.path.join(tempfile.gettempdir(), file_name)
+        temp_path = os.path.join(tempfile.gettempdir(), original_file_name)
         await tg_file.download_to_drive(temp_path)
 
         folder_type = doc_info['folder']
         folders = drive.create_client_folder_structure(client['full_name'], client['phone'])
         target_folder_id = folders[folder_type]['id']
 
-        drive_file = drive.upload_file(temp_path, target_folder_id, file_name)
+        # Загружаем с новым именем
+        drive_file = drive.upload_file(temp_path, target_folder_id, new_file_name)
 
         db.add_document(
             client_id=client['id'],
             document_type=doc_key,
-            file_name=file_name,
+            file_name=new_file_name,
             drive_file_id=drive_file['id'],
             drive_file_url=drive_file['webViewLink'],
             file_size=int(drive_file.get('size', 0))
@@ -857,22 +878,20 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if 'uploaded_files' not in context.user_data:
             context.user_data['uploaded_files'] = []
-        context.user_data['uploaded_files'].append(file_name)
+        context.user_data['uploaded_files'].append(new_file_name)
 
-        # Удаляем сообщение о загрузке
-        await loading_msg.delete()
+        # Удаляем сообщение о загрузке только если оно было создано
+        if loading_msg:
+            await loading_msg.delete()
 
-        count = len(context.user_data['uploaded_files'])
-        await update.message.reply_text(
-            f"✅ Файл завантажено: {file_name}\n"
-            f"📊 Завантажено файлів: {count}\n\n"
-            f"Надішліть ще файли або натисніть \"✅ Готово\" для завершення."
-        )
+        # НЕ отправляем сообщение после каждого файла - только тихое подтверждение
+        # Сообщение будет только при нажатии "Готово"
 
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         # Удаляем сообщение о загрузке в случае ошибки
-        await loading_msg.delete()
+        if loading_msg:
+            await loading_msg.delete()
         await update.message.reply_text(
             f"❌ Помилка завантаження файлу: {str(e)}\n"
             f"Спробуйте ще раз або зв'яжіться з менеджером."
@@ -912,7 +931,12 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uploaded_count == 0:
             message = f"⚠️ Ви не завантажили жодного файлу для \"{doc_info['name']}\""
         else:
-            message = f"✅ Завантажено {uploaded_count} файл(ів) для \"{doc_info['name']}\"!"
+            # Показываем список загруженных файлов
+            uploaded_files = context.user_data.get('uploaded_files', [])
+            message = f"✅ Завантажено файлів: {uploaded_count}\n\n"
+            message += "📎 <b>Список файлів:</b>\n"
+            for idx, file_name in enumerate(uploaded_files, 1):
+                message += f"{idx}. {file_name}\n"
 
     context.user_data.pop('uploading_doc_type', None)
     context.user_data.pop('uploaded_files', None)
