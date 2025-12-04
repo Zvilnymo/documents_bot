@@ -783,38 +783,13 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if doc_info.get('is_text') and update.message.text:
         password = update.message.text.strip()
 
-        # Показываем сообщение о загрузке
-        loading_msg = await update.message.reply_text("⏳ Очікуйте, зберігаємо пароль...")
+        # Сохраняем пароль в context, чтобы записать при нажатии "Готово"
+        context.user_data['ec_password'] = password
 
-        try:
-            # Создаём папки и сохраняем пароль сразу
-            folders = drive.create_client_folder_structure(client['full_name'], client['phone'])
-            personal_folder_id = folders['personal']['id']
-            drive.create_text_file(password, 'Пароль_ЕЦП.txt', personal_folder_id)
-
-            # Сохраняем в базу
-            db.save_ec_password(client['id'], password)
-            db.update_last_activity(client['id'])
-
-            # Удаляем сообщение о загрузке
-            await loading_msg.delete()
-
-            await update.message.reply_text(
-                f"✅ Пароль від ЕЦП збережено!\n\n"
-                f"Натисніть \"✅ Готово\" для завершення або надішліть ще документи."
-            )
-
-            # Помечаем как завершённое
-            context.user_data.pop('uploading_doc_type', None)
-            context.user_data.pop('ec_password', None)
-
-        except Exception as e:
-            logger.error(f"Error saving password: {e}")
-            await loading_msg.delete()
-            await update.message.reply_text(
-                f"❌ Помилка збереження пароля: {str(e)}\n"
-                f"Спробуйте ще раз."
-            )
+        await update.message.reply_text(
+            f"✅ Пароль збережено!\n\n"
+            f"Натисніть \"✅ Готово\" для завершення."
+        )
         return
 
     if not update.message.document and not update.message.photo:
@@ -841,7 +816,7 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Получаем расширение файла
         file_ext = os.path.splitext(original_file_name)[1]
 
-        # Создаём новое имя файла: ТипДокумента_Имя_Фамилия.расширение
+        # Создаём новое имя файла: ТипДокумента_Имя_Фамилия_N.расширение
         doc_type_name = doc_info.get('short', doc_info['name']).replace('/', '_').replace('\\', '_')
         client_name_parts = client['full_name'].split()
         if len(client_name_parts) >= 2:
@@ -850,8 +825,15 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             short_name = client['full_name'].replace(' ', '_')
 
-        # Новое имя: Паспорт_Іван_Іваненко.pdf
-        new_file_name = f"{doc_type_name}_{short_name}{file_ext}"
+        # Для множественных файлов добавляем номер
+        if doc_info.get('multiple'):
+            # Считаем сколько файлов этого типа уже загружено
+            uploaded_count = len(context.user_data.get('uploaded_files', []))
+            file_number = uploaded_count + 1
+            new_file_name = f"{doc_type_name}_{short_name}_{file_number}{file_ext}"
+        else:
+            # Для одиночных файлов без номера
+            new_file_name = f"{doc_type_name}_{short_name}{file_ext}"
 
         tg_file = await context.bot.get_file(file.file_id)
         temp_path = os.path.join(tempfile.gettempdir(), original_file_name)
@@ -884,8 +866,18 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if loading_msg:
             await loading_msg.delete()
 
-        # НЕ отправляем сообщение после каждого файла - только тихое подтверждение
-        # Сообщение будет только при нажатии "Готово"
+        # Формируем ОДНО сообщение со списком всех загруженных файлов
+        uploaded_files = context.user_data['uploaded_files']
+        count = len(uploaded_files)
+
+        message = ""
+        for file_name in uploaded_files:
+            message += f"✅ Файл завантажено: {file_name}\n"
+
+        message += f"📊 Завантажено файлів: {count}\n\n"
+        message += "Надішліть ще файли або натисніть \"✅ Готово\" для завершення."
+
+        await update.message.reply_text(message)
 
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
@@ -976,12 +968,16 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Прогрес: {required_uploaded}/{required_total}"
         )
 
-    message += "\n\n👇 Повертаємось до чек-листа..."
+    # Отправляем итоговое сообщение
     await query.edit_message_text(message, parse_mode='HTML')
 
+    # Возвращаем главное меню с кнопкой
     import asyncio
     await asyncio.sleep(1)
-    await show_checklist(update, context)
+    await update.effective_chat.send_message(
+        "👇 Оберіть дію:",
+        reply_markup=get_main_keyboard()
+    )
 
 async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
