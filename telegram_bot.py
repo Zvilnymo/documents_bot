@@ -1592,7 +1592,12 @@ async def declaration_ask_question(update: Update, context: ContextTypes.DEFAULT
 async def declaration_receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробка текстової відповіді"""
     client, admin_id = get_active_client(update, context)
-    q_index = context.user_data['declaration_current_q']
+    q_index = context.user_data.get('declaration_current_q')
+
+    # Якщо немає даних про поточне питання - conversation вже завершено
+    if q_index is None:
+        return ConversationHandler.END
+
     question = DECLARATION_QUESTIONS[q_index]
 
     # Якщо це питання з файлами - переходимо до обробки файлів
@@ -1887,7 +1892,7 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Завантажуємо файл
         file_name = f"Анкета_{client['full_name']}.txt"
-        drive_file = drive.upload_file(temp_path, declaration_folder_id, file_name)
+        drive.upload_file(temp_path, declaration_folder_id, file_name)
         os.remove(temp_path)
 
         # Оновлюємо статус декларації
@@ -1904,8 +1909,7 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
         # Повідомлення про завершення
         message = (
             f"✅ <b>Анкету успішно заповнено!</b>\n\n"
-            f"📁 Відповіді збережено на Google Drive\n"
-            f"📄 <a href=\"{drive_file['webViewLink']}\">Переглянути анкету</a>\n\n"
+            f"📁 Відповіді збережено\n\n"
             f"Дякуємо за відповіді! Наш менеджер опрацює інформацію "
             f"та зв'яжеться з вами найближчим часом."
         )
