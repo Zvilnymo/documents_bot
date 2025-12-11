@@ -674,17 +674,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Відправляємо відео-інструкцію
-    video_path = "zvilnymo_compressed.mp4"
-    if os.path.exists(video_path):
-        try:
-            with open(video_path, 'rb') as video_file:
-                await update.message.reply_video(
-                    video=video_file,
-                    caption="📹 Інструкція: Як користуватися ботом для збору документів",
-                    supports_streaming=True
-                )
-        except Exception as e:
-            logger.error(f"Failed to send video: {e}")
+    try:
+        await update.message.reply_video(
+            video="BAACAgIAAxkBAAMmaTq9GiWURbh-ewbGm3Ct4TP-B8YAAouOAAKph9BJDAkmDzQ_hI02BA",
+            caption="📹 Інструкція: Як користуватися ботом для збору документів",
+            supports_streaming=True
+        )
+    except Exception as e:
+        logger.error(f"Failed to send video: {e}")
 
     await update.message.reply_text(
         "👆 <b>Перегляньте відео вище - це коротка інструкція про те, як працювати з ботом!</b>\n\n"
