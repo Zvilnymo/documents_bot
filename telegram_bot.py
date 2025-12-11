@@ -628,6 +628,8 @@ CALLBACK_DONE = "done"
 CALLBACK_BACK = "back"
 CALLBACK_DECL_START = "decl_start"
 CALLBACK_DECL_SKIP = "decl_skip"
+CALLBACK_DECL_PREVIOUS = "decl_previous"
+CALLBACK_DECL_MENU = "decl_menu"
 
 db = Database()
 drive = DriveManager()
@@ -1494,13 +1496,31 @@ async def declaration_begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отримуємо або створюємо запис декларації
     declaration = db.get_or_create_declaration(client['id'])
 
+    # Знаходимо перше питання без відповіді (відновлюємо прогрес)
+    current_question_index = 0
+    for idx, question in enumerate(DECLARATION_QUESTIONS):
+        answer = declaration.get(question['key'])
+        # Якщо відповідь пуста або None - це наше поточне питання
+        if not answer:
+            current_question_index = idx
+            break
+    else:
+        # Якщо всі питання мають відповіді, але анкета не завершена
+        current_question_index = len(DECLARATION_QUESTIONS) - 1
+
     # Ініціалізуємо дані для conversation
-    context.user_data['declaration_current_q'] = 0
+    context.user_data['declaration_current_q'] = current_question_index
     context.user_data['declaration_id'] = declaration['id']
 
-    await query.edit_message_text("🚀 Розпочинаємо заповнення анкети...")
+    if current_question_index > 0:
+        await query.edit_message_text(
+            f"🔄 Продовжуємо заповнення анкети...\n\n"
+            f"Ви вже відповіли на {current_question_index} питань."
+        )
+    else:
+        await query.edit_message_text("🚀 Розпочинаємо заповнення анкети...")
 
-    # Показуємо перше питання
+    # Показуємо поточне питання
     await declaration_ask_question(update, context)
 
     return DECL_QUESTION
@@ -1539,8 +1559,14 @@ async def declaration_ask_question(update: Update, context: ContextTypes.DEFAULT
     if not question['required']:
         buttons.append([InlineKeyboardButton("⏭ Пропустити", callback_data=CALLBACK_DECL_SKIP)])
 
-    # Завжди додаємо кнопку "Назад"
-    buttons.append([InlineKeyboardButton("« Назад", callback_data=CALLBACK_BACK)])
+    # Навігація
+    nav_buttons = []
+    if q_index > 0:
+        # Показуємо "Попереднє питання" тільки якщо не на першому питанні
+        nav_buttons.append(InlineKeyboardButton("⬅️ Попереднє", callback_data=CALLBACK_DECL_PREVIOUS))
+    nav_buttons.append(InlineKeyboardButton("🏠 Головне меню", callback_data=CALLBACK_DECL_MENU))
+
+    buttons.append(nav_buttons)
 
     keyboard = InlineKeyboardMarkup(buttons)
 
@@ -1858,8 +1884,38 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
 
     return ConversationHandler.END
 
+async def declaration_previous(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повернутися до попереднього питання"""
+    query = update.callback_query
+    await query.answer()
+
+    # Переходимо до попереднього питання
+    current_q = context.user_data.get('declaration_current_q', 0)
+    if current_q > 0:
+        context.user_data['declaration_current_q'] = current_q - 1
+
+    # Показуємо попереднє питання
+    await declaration_ask_question(update, context)
+
+    return DECL_QUESTION
+
+async def declaration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вийти в головне меню зі збереженням прогресу"""
+    query = update.callback_query
+    await query.answer("💾 Прогрес збережено!")
+
+    # НЕ очищаємо дані - прогрес зберігається в БД
+    # Просто очищаємо тимчасові дані conversation
+    context.user_data.pop('declaration_current_q', None)
+    context.user_data.pop('declaration_files', None)
+
+    # Повертаємося до чек-листа
+    await show_checklist(update, context)
+
+    return ConversationHandler.END
+
 async def declaration_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Повернутися назад до чек-листа"""
+    """Повернутися назад до чек-листа (з початкового екрану)"""
     query = update.callback_query
     await query.answer()
 
@@ -2131,14 +2187,16 @@ def main():
             DECL_QUESTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, declaration_receive_answer),
                 CallbackQueryHandler(declaration_skip, pattern=f"^{CALLBACK_DECL_SKIP}$"),
-                CallbackQueryHandler(declaration_back, pattern=f"^{CALLBACK_BACK}$")
+                CallbackQueryHandler(declaration_previous, pattern=f"^{CALLBACK_DECL_PREVIOUS}$"),
+                CallbackQueryHandler(declaration_menu, pattern=f"^{CALLBACK_DECL_MENU}$")
             ],
             DECL_FILES: [
                 MessageHandler(filters.Document.ALL, declaration_handle_files),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, declaration_handle_files),
                 CallbackQueryHandler(declaration_handle_files, pattern=f"^{CALLBACK_DONE}$"),
                 CallbackQueryHandler(declaration_handle_files, pattern=f"^{CALLBACK_DECL_SKIP}$"),
-                CallbackQueryHandler(declaration_back, pattern=f"^{CALLBACK_BACK}$")
+                CallbackQueryHandler(declaration_previous, pattern=f"^{CALLBACK_DECL_PREVIOUS}$"),
+                CallbackQueryHandler(declaration_menu, pattern=f"^{CALLBACK_DECL_MENU}$")
             ]
         },
         fallbacks=[CommandHandler('cancel', declaration_cancel)],
