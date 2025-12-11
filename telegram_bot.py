@@ -1004,6 +1004,9 @@ async def show_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE, for
         row = buttons[i:i+2]
         keyboard.append(row)
 
+    # Додаємо кнопку "Анкета декларації" внизу, розтягнуту на всю ширину
+    keyboard.append([InlineKeyboardButton("📋 Анкета декларації", callback_data=CALLBACK_DECL_START)])
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if query and not force_new_message:
@@ -1430,8 +1433,7 @@ def get_progress_bar(current, total, length=20):
 
 def get_main_keyboard():
     keyboard = [
-        [KeyboardButton("📋 Чек-лист документів")],
-        [KeyboardButton("📋 Анкета декларації")]
+        [KeyboardButton("📋 Чек-лист документів")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1441,31 +1443,30 @@ def get_main_keyboard():
 
 async def declaration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробка натискання кнопки 'Анкета декларації'"""
-    client, admin_id = get_active_client(update, context)
+    query = update.callback_query
+    await query.answer()
+
+    client, _ = get_active_client(update, context)
 
     if not client:
-        await update.message.reply_text("❌ Спочатку зареєструйтесь: /start")
+        await query.edit_message_text("❌ Спочатку зареєструйтесь: /start")
         return ConversationHandler.END
 
     # Перевіряємо чи вже є заповнена анкета
     declaration = db.get_declaration(client['id'])
     if declaration and declaration['status'] == 'completed':
         completed_at = declaration['completed_at'].strftime('%d.%m.%Y %H:%M')
-        await update.message.reply_text(
+        await query.edit_message_text(
             f"✅ <b>Ви вже заповнили анкету декларації</b>\n\n"
             f"📅 Заповнено: {completed_at}\n\n"
             f"💡 Редагування анкети неможливе. Якщо потрібно внести зміни, "
             f"зв'яжіться з менеджером.",
-            parse_mode='HTML',
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("📋 Чек-лист документів")]],
-                resize_keyboard=True
-            )
+            parse_mode='HTML'
         )
         return ConversationHandler.END
 
     # Показуємо привітання та інструкцію
-    await update.message.reply_text(
+    await query.edit_message_text(
         "📋 <b>Анкета для складання податкової декларації</b>\n\n"
         "Вам буде задано 17 питань про фінансову діяльність за 2022-2025 роки.\n\n"
         "⚠️ <b>Важливо:</b>\n"
@@ -1476,7 +1477,7 @@ async def declaration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 Готові розпочати?",
         parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Почати заповнення", callback_data=CALLBACK_DECL_START)
+            InlineKeyboardButton("✅ Почати заповнення", callback_data="decl_begin")
         ]])
     )
 
@@ -2101,14 +2102,11 @@ def main():
     # Declaration form conversation handler
     declaration_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(
-                filters.TEXT & filters.Regex("^📋 Анкета декларації$"),
-                declaration_start
-            )
+            CallbackQueryHandler(declaration_start, pattern=f"^{CALLBACK_DECL_START}$")
         ],
         states={
             DECL_START: [
-                CallbackQueryHandler(declaration_begin, pattern=f"^{CALLBACK_DECL_START}$")
+                CallbackQueryHandler(declaration_begin, pattern=f"^decl_begin$")
             ],
             DECL_QUESTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, declaration_receive_answer),
@@ -2121,7 +2119,8 @@ def main():
                 CallbackQueryHandler(declaration_handle_files, pattern=f"^{CALLBACK_DECL_SKIP}$")
             ]
         },
-        fallbacks=[CommandHandler('cancel', declaration_cancel)]
+        fallbacks=[CommandHandler('cancel', declaration_cancel)],
+        per_message=False
     )
 
     application.add_handler(conv_handler)
