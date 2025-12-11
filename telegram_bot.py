@@ -1636,7 +1636,17 @@ async def declaration_handle_files(update: Update, context: ContextTypes.DEFAULT
         await query.answer()
 
         if query.data == CALLBACK_DECL_SKIP:
-            # Пропускаємо питання
+            # Пропускаємо питання з файлами - зберігаємо "ПРОПУЩЕНО"
+            db.update_declaration_answer(client['id'], question['key'], "ПРОПУЩЕНО")
+
+            # Логуємо
+            db.log_notification(
+                client_id=client['id'],
+                notification_type='declaration_answer',
+                message=f"Питання {q_index + 1} (файли) пропущено",
+                admin_telegram_id=admin_id
+            )
+
             context.user_data['declaration_current_q'] += 1
             context.user_data.pop('declaration_files', None)
             await declaration_ask_question(update, context)
@@ -1748,12 +1758,24 @@ async def declaration_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    client, admin_id = get_active_client(update, context)
     q_index = context.user_data['declaration_current_q']
     question = DECLARATION_QUESTIONS[q_index]
 
     if question['required']:
         await query.answer("❌ Це питання обов'язкове!", show_alert=True)
         return DECL_QUESTION
+
+    # Зберігаємо "ПРОПУЩЕНО" в БД щоб при поверненні не питати знову
+    db.update_declaration_answer(client['id'], question['key'], "ПРОПУЩЕНО")
+
+    # Логуємо
+    db.log_notification(
+        client_id=client['id'],
+        notification_type='declaration_answer',
+        message=f"Питання {q_index + 1} пропущено",
+        admin_telegram_id=admin_id
+    )
 
     # Переходимо до наступного питання
     context.user_data['declaration_current_q'] += 1
@@ -1781,7 +1803,7 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
 
         content += f"{idx}. {question['question']}\n"
 
-        if answer:
+        if answer and answer != "ПРОПУЩЕНО":
             if question.get('type') == 'files':
                 # Якщо це файли - розпарсимо JSON
                 try:
