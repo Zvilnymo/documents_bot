@@ -986,6 +986,16 @@ async def show_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE, for
             else:
                 message += f"⚪️ {emoji} {name}\n"
 
+    # Додаємо статус анкети декларації
+    declaration = db.get_declaration(client['id'])
+    declaration_completed = declaration and declaration['status'] == 'completed'
+
+    message += f"\n<b>Анкета:</b>\n"
+    if declaration_completed:
+        message += f"✅ 📋 Анкета декларації\n"
+    else:
+        message += f"❌ 📋 Анкета декларації\n"
+
     message += f"\n💡 <i>Натисніть на документ нижче, щоб завантажити</i>"
 
     # Создаём кнопки и группируем их по 2 в строке
@@ -1007,7 +1017,12 @@ async def show_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE, for
         keyboard.append(row)
 
     # Додаємо кнопку "Анкета декларації" внизу, розтягнуту на всю ширину
-    keyboard.append([InlineKeyboardButton("📋 Анкета декларації", callback_data=CALLBACK_DECL_START)])
+    # З галочкою якщо заповнено
+    if declaration_completed:
+        decl_button_text = "✅ Анкета декларації"
+    else:
+        decl_button_text = "📋 Анкета декларації"
+    keyboard.append([InlineKeyboardButton(decl_button_text, callback_data=CALLBACK_DECL_START)])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1818,6 +1833,12 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
     """Завершення анкети та створення файлу"""
     client, admin_id = get_active_client(update, context)
 
+    # Показуємо проміжне повідомлення про збереження
+    if update.callback_query:
+        saving_msg = await update.callback_query.edit_message_text("💾 Зберігаємо відповіді...")
+    else:
+        saving_msg = await update.message.reply_text("💾 Зберігаємо відповіді...")
+
     # Отримуємо всі відповіді
     declaration = db.get_declaration(client['id'])
 
@@ -1906,36 +1927,47 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
             admin_telegram_id=admin_id
         )
 
-        # Повідомлення про завершення
-        message = (
+        # Повідомлення про завершення та автоматичний показ чек-листа
+        completion_message = (
             f"✅ <b>Анкету успішно заповнено!</b>\n\n"
             f"📁 Відповіді збережено\n\n"
             f"Дякуємо за відповіді! Наш менеджер опрацює інформацію "
             f"та зв'яжеться з вами найближчим часом."
         )
 
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                message,
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
-        else:
-            await update.message.reply_text(
-                message,
-                parse_mode='HTML',
-                disable_web_page_preview=True,
-                reply_markup=get_main_keyboard()
-            )
+        # Видаляємо повідомлення про збереження та показуємо завершення
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=saving_msg.message_id
+        )
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=completion_message,
+            parse_mode='HTML'
+        )
+
+        # Автоматично показуємо чек-лист (як після завантаження документів)
+        import asyncio
+        await asyncio.sleep(0.5)
+        await show_checklist(update, context, force_new_message=True)
 
     except Exception as e:
         logger.error(f"Error completing declaration: {e}")
         error_message = "❌ Помилка збереження анкети. Зв'яжіться з менеджером."
 
-        if update.callback_query:
-            await update.callback_query.edit_message_text(error_message)
-        else:
-            await update.message.reply_text(error_message)
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=saving_msg.message_id
+            )
+        except:
+            pass
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=error_message
+        )
 
     # Очищаємо дані conversation
     context.user_data.pop('declaration_current_q', None)
