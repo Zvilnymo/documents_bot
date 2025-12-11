@@ -1572,17 +1572,20 @@ async def declaration_ask_question(update: Update, context: ContextTypes.DEFAULT
 
     # Відправляємо питання
     if update.callback_query:
-        await update.callback_query.edit_message_text(
+        sent_msg = await update.callback_query.edit_message_text(
             message,
             parse_mode='HTML',
             reply_markup=keyboard
         )
     else:
-        await update.message.reply_text(
+        sent_msg = await update.message.reply_text(
             message,
             parse_mode='HTML',
             reply_markup=keyboard
         )
+
+    # Зберігаємо message_id щоб видалити пізніше
+    context.user_data['last_question_message_id'] = sent_msg.message_id
 
     return DECL_QUESTION if question.get('type') != 'files' else DECL_FILES
 
@@ -1602,6 +1605,20 @@ async def declaration_receive_answer(update: Update, context: ContextTypes.DEFAU
     if not answer:
         await update.message.reply_text("❌ Будь ласка, введіть відповідь або пропустіть питання.")
         return DECL_QUESTION
+
+    # Видаляємо попереднє питання та відповідь користувача
+    try:
+        # Видаляємо питання
+        last_q_msg_id = context.user_data.get('last_question_message_id')
+        if last_q_msg_id:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=last_q_msg_id
+            )
+        # Видаляємо відповідь користувача
+        await update.message.delete()
+    except Exception as e:
+        logger.error(f"Error deleting messages: {e}")
 
     # Зберігаємо відповідь у БД
     db.update_declaration_answer(client['id'], question['key'], answer)
@@ -1684,7 +1701,7 @@ async def declaration_handle_files(update: Update, context: ContextTypes.DEFAULT
 
             # Перевіряємо чи є папка "Декларація", якщо ні - створюємо
             declaration_folder_id = None
-            parent_folder_id = folders['root']['id']
+            parent_folder_id = folders['client']['id']  # Виправлено: client замість root
 
             # Шукаємо папку "Декларація"
             existing_folders = drive.service.files().list(
@@ -1759,7 +1776,13 @@ async def declaration_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     client, admin_id = get_active_client(update, context)
-    q_index = context.user_data['declaration_current_q']
+    q_index = context.user_data.get('declaration_current_q')
+
+    # Якщо немає даних про поточне питання - щось пішло не так
+    if q_index is None:
+        await query.answer("❌ Помилка. Спробуйте почати заново.", show_alert=True)
+        return ConversationHandler.END
+
     question = DECLARATION_QUESTIONS[q_index]
 
     if question['required']:
@@ -1830,7 +1853,7 @@ async def declaration_complete(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Отримуємо або створюємо папку "Декларація"
         folders = drive.create_client_folder_structure(client['full_name'], client['phone'])
-        parent_folder_id = folders['root']['id']
+        parent_folder_id = folders['client']['id']  # Виправлено: client замість root
 
         existing_folders = drive.service.files().list(
             q=f"name='Декларація' and '{parent_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
