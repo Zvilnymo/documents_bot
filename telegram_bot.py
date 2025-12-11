@@ -2474,13 +2474,15 @@ def main():
     job_queue = application.job_queue
 
     # Запускаємо перевірку щодня о 10:00 за київським часом
+    import datetime as dt
     kyiv_tz = pytz.timezone('Europe/Kiev')
+    check_time = dt.time(hour=10, minute=0, tzinfo=kyiv_tz)
+
     job_queue.run_daily(
         check_and_send_reminders,
-        time=datetime.strptime("10:00", "%H:%M").time(),
+        time=check_time,
         days=(0, 1, 2, 3, 4, 5, 6),  # Всі дні тижня
-        name="daily_reminder_check",
-        tzinfo=kyiv_tz
+        name="daily_reminder_check"
     )
 
     logger.info("Daily reminder job scheduled for 10:00 Kyiv time")
