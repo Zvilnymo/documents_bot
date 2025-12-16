@@ -8,7 +8,7 @@ import tempfile
 import base64
 import json
 import pytz
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -917,7 +917,8 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
         for client in inactive_clients:
             try:
                 # Підраховуємо кількість днів неактивності
-                days_inactive = (datetime.now() - client['last_activity']).days
+                now_utc = datetime.now(timezone.utc)
+                days_inactive = (now_utc - client['last_activity']).days
 
                 # Отримуємо останнє нагадування
                 last_reminder = db.get_last_reminder(client['id'])
@@ -930,7 +931,7 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                     should_send = days_inactive >= 3
                 else:
                     # Підраховуємо час з останнього нагадування
-                    days_since_last = (datetime.now() - last_reminder['sent_at']).days
+                    days_since_last = (now_utc - last_reminder['sent_at']).days
 
                     if days_inactive < 10:
                         # До 10 днів - кожні 3 дні
