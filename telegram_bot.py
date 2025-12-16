@@ -1555,15 +1555,35 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             admin_telegram_id=admin_id
         )
 
-        # Сповіщаємо адмінів про завантаження (зберігаємо існуючу логіку)
-        if not admin_id:  # Тільки якщо завантажує клієнт (не адмін)
+        # Сповіщаємо адмінів про завантаження (ТІЛЬКИ для клієнтів, не адмінів)
+        # Об'єднана нотифікація з прогресом і статусом AI
+        if not admin_id:
+            # Рахуємо прогрес
+            uploaded_types = db.get_uploaded_types(client['id'])
+            has_ecpass = db.get_ec_password(client['id']) is not None
+            if has_ecpass:
+                uploaded_types['ecpass'] = 1
+            required_uploaded = sum(1 for doc in REQUIRED_DOCUMENTS if doc in uploaded_types)
+            required_total = len(REQUIRED_DOCUMENTS)
+
+            # Визначаємо статус AI для повідомлення
+            ai_status_emoji = "✅"
+            ai_status_text = validation_result.status if validation_result else 'не перевірено'
+            if validation_result:
+                if validation_result.is_accepted():
+                    ai_status_emoji = "✅"
+                elif validation_result.is_uncertain():
+                    ai_status_emoji = "⚠️"
+
             await notify_admins(
-                f"📄 <b>Новий документ</b>\n\n"
+                f"📄 <b>Клієнт завантажив документ</b>\n\n"
                 f"👤 {client['full_name']}\n"
                 f"📱 {client['phone']}\n"
-                f"📋 Тип: {doc_info['name']}\n"
-                f"✅ Статус AI: {validation_result.status if validation_result else 'не перевірено'}\n\n"
-                f"📁 <a href=\"{drive_file['webViewLink']}\">Переглянути документ</a>"
+                f"📑 {doc_info['name']}\n"
+                f"{ai_status_emoji} <b>AI:</b> {ai_status_text}\n"
+                f"📊 <b>Прогрес:</b> {required_uploaded}/{required_total} документів\n\n"
+                f"📁 <a href=\"{drive_file['webViewLink']}\">Переглянути документ</a>\n"
+                f"📂 <a href=\"{client['drive_folder_url']}\">Папка клієнта</a>"
             )
 
         db.update_last_activity(client['id'])
@@ -1720,14 +1740,7 @@ async def handle_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             message += f"\n\n🚀 <b>Чудова робота!</b> Продовжуйте у тому ж дусі! 💪"
 
-        await notify_admins(
-            f"📄 Клієнт завантажив документ\n\n"
-            f"👤 {client['full_name']}\n"
-            f"📱 {client['phone']}\n"
-            f"📑 {doc_info['name']}\n"
-            f"📊 Статус: {client['status']} ({required_uploaded}/{required_total} документів)\n"
-            f"📁 <a href=\"{client['drive_folder_url']}\">Відкрити папку на Drive</a>"
-        )
+        # Нотифікація вже відправлена в handle_file_upload(), не дублюємо
 
     # Отправляем итоговое сообщение
     await query.edit_message_text(message, parse_mode='HTML')
