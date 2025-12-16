@@ -941,11 +941,16 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
 
                 if should_send:
                     # Формуємо повідомлення залежно від прогресу
-                    doc_counts = db.get_document_counts(client['id'])
-                    uploaded = sum(doc_counts.values())
+                    uploaded_types = db.get_uploaded_types(client['id'])
+                    # Перевіряємо пароль ЕЦП
+                    has_ecpass = db.get_ec_password(client['id']) is not None
+                    if has_ecpass:
+                        uploaded_types['ecpass'] = 1
+                    # Рахуємо тільки обов'язкові документи
+                    required_uploaded = sum(1 for doc in REQUIRED_DOCUMENTS if doc in uploaded_types)
                     required_total = len(REQUIRED_DOCUMENTS)
 
-                    if uploaded == 0:
+                    if required_uploaded == 0:
                         message = (
                             f"👋 Вітаю, {client['full_name']}!\n\n"
                             f"😊 Нагадуємо, що ви ще не завантажили жодного документа.\n\n"
@@ -955,7 +960,7 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                     else:
                         message = (
                             f"👋 Вітаю, {client['full_name']}!\n\n"
-                            f"📊 Ви завантажили {uploaded} з {required_total} обов'язкових документів.\n\n"
+                            f"📊 Ви завантажили {required_uploaded} з {required_total} обов'язкових документів.\n\n"
                             f"😊 Будь ласка, завершіть завантаження решти документів.\n\n"
                             f"🎁 Нагадуємо: при зборі всіх документів ви отримаєте бонус від компанії!\n\n"
                             f"💡 Натисніть /start щоб продовжити."
@@ -985,7 +990,7 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
                             f"👤 {client['full_name']}\n"
                             f"📱 {client['phone']}\n"
                             f"📊 Неактивний: {days_inactive} днів\n"
-                            f"📄 Завантажено: {uploaded}/{required_total} документів"
+                            f"📄 Завантажено: {required_uploaded}/{required_total} документів"
                         )
 
             except Exception as e:
