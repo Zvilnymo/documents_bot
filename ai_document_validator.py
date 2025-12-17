@@ -7,6 +7,7 @@ import os
 import json
 import base64
 import logging
+import re
 from typing import Dict, Optional, Tuple
 from PIL import Image
 from io import BytesIO
@@ -115,6 +116,79 @@ class AIDocumentValidator:
 
         # кеш, щоб не аплоадити один і той самий pdf повторно
         self._pdf_file_id_cache: Dict[Tuple[str, int], str] = {}
+
+    # ---------------- JSON cleaning helpers ----------------
+
+    def _extract_json_text(self, text: str) -> str:
+        """
+        Витягує перший JSON-об'єкт з довільного тексту.
+        Підтримує випадки:
+        - ```json ... ```
+        - текст до/після JSON
+        - просто валідний JSON
+        """
+        if not text:
+            raise ValueError("Empty model response")
+
+        t = text.strip()
+
+        # 1) прибираємо markdown code fences на початку/в кінці
+        #    ```json\n{...}\n```  ->  {...}
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = re.sub(r"\s*```$", "", t).strip()
+
+        # 2) якщо вже чистий json-об'єкт
+        if t.startswith("{") and t.endswith("}"):
+            return t
+
+        # 3) знаходимо перший JSON-об'єкт по балансу фігурних дужок
+        start = t.find("{")
+        if start == -1:
+            raise ValueError("No '{' found in model response")
+
+        depth = 0
+        in_string = False
+        escape = False
+
+        for i in range(start, len(t)):
+            ch = t[i]
+
+            # коректно ігноруємо дужки всередині строк
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            else:
+                if ch == '"':
+                    in_string = True
+                    continue
+
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return t[start:i + 1]
+
+        raise ValueError("JSON object not closed in model response")
+
+    def _safe_json_loads(self, text: str) -> Dict:
+        """
+        1) пробує json.loads(text)
+        2) якщо падає — чистить текст і пробує ще раз
+        """
+        try:
+            return json.loads(text)
+        except Exception:
+            cleaned = self._extract_json_text(text)
+            return json.loads(cleaned)
+
+    # ---------------- main flow ----------------
 
     def validate_document(self, file_path: str, document_type: str) -> Optional[ValidationResult]:
         """Перевірити документ за допомогою AI"""
@@ -229,10 +303,11 @@ class AIDocumentValidator:
                 response_format={"type": "json_object"}
             )
 
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content or ""
             logger.debug(f"GPT-4 Vision raw response: {content}")
 
-            return json.loads(content)
+            # ✅ безопасный парсинг (на случай если вдруг прилетит мусор)
+            return self._safe_json_loads(content)
 
         except Exception as e:
             logger.error(f"Error calling GPT-4 Vision API: {e}")
@@ -261,11 +336,19 @@ class AIDocumentValidator:
         Викликати OpenAI Responses API для PDF:
         - PDF -> input_file (file_id)
         - + input_text prompt
-        Очікуємо строгий JSON у відповіді (як в prompt).
+        Очікуємо строгий JSON у відповіді (але чистимо, якщо модель додала ```json).
         """
         assert _responses_client is not None
 
         file_id = self._upload_pdf_get_file_id(pdf_path)
+
+        # (опціонально) підсилюємо вимогу до формату
+        strict_prompt = (
+            "Відповідай ТІЛЬКИ валідним JSON-об’єктом. "
+            "Без markdown, без ```json, без пояснень. "
+            "Починай відповідь з '{' і закінчуй '}'.\n\n"
+            + prompt
+        )
 
         resp = _responses_client.responses.create(
             model=self.pdf_model,
@@ -273,7 +356,7 @@ class AIDocumentValidator:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": prompt},
+                        {"type": "input_text", "text": strict_prompt},
                         {"type": "input_file", "file_id": file_id},
                     ],
                 }
@@ -285,7 +368,8 @@ class AIDocumentValidator:
         raw_text = (getattr(resp, "output_text", "") or "").strip()
         logger.info(f"OpenAI raw response text (PDF): {raw_text[:500]}{'...' if len(raw_text) > 500 else ''}")
 
-        return json.loads(raw_text)
+        # ✅ чистим и парсим
+        return self._safe_json_loads(raw_text)
 
     # ---------------- parse response ----------------
 
