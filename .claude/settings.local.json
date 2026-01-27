@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(dir \"c:\\\\Users\\\\Андрей\\\\computer\\\\Desktop\\\\documents_bot-main\")"
+      "Bash(dir \"c:\\\\Users\\\\Андрей\\\\computer\\\\Desktop\\\\documents_bot-main\")",
+      "Bash(git remote set-url:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+      "Bash(git reset:*)",
+      "Bash(git fetch:*)",
+      "Bash(git rm:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

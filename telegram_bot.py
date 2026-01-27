@@ -33,9 +33,6 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 # AI Document Validator
 from ai_document_validator import validator as ai_validator
 
-# Google Sheets Sync
-from google_sheets_manager import get_sheets_manager
-
 # ============================================================================
 # КОНФІГУРАЦІЯ
 # ============================================================================
@@ -2758,34 +2755,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
 # ============================================================================
-# GOOGLE SHEETS SYNC
-# ============================================================================
-
-async def sync_with_google_sheets(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Періодична синхронізація з Google Sheets кожні 4 години
-    Викликається автоматично планувальником
-    """
-    logger.info("Starting Google Sheets sync...")
-
-    try:
-        sheets_manager = get_sheets_manager()
-        if sheets_manager is None:
-            logger.warning("Google Sheets manager not available, skipping sync")
-            return
-
-        # Інкрементальна синхронізація (тільки зміни)
-        success = sheets_manager.incremental_sync(db)
-
-        if success:
-            logger.info("Google Sheets sync completed successfully")
-        else:
-            logger.error("Google Sheets sync failed")
-
-    except Exception as e:
-        logger.error(f"Error during Google Sheets sync: {e}")
-
-# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -2901,31 +2870,6 @@ def main():
     )
 
     logger.info("Daily reminder job scheduled for 14:03 Kyiv time")
-
-    # Google Sheets синхронізація кожні 4 години
-    job_queue.run_repeating(
-        sync_with_google_sheets,
-        interval=4 * 60 * 60,  # 4 години в секундах
-        first=10,  # Перший запуск через 10 секунд після старту
-        name="google_sheets_sync"
-    )
-
-    logger.info("Google Sheets sync job scheduled (every 4 hours)")
-
-    # Початкова синхронізація (якщо таблиця порожня - зробити initial_sync)
-    try:
-        sheets_manager = get_sheets_manager()
-        if sheets_manager:
-            logger.info("Running initial Google Sheets check...")
-            # Перевіряємо чи є дані в таблиці
-            existing_rows = sheets_manager._get_all_rows()
-            if len(existing_rows) == 0:
-                logger.info("Table is empty, running initial sync...")
-                sheets_manager.initial_sync(db)
-            else:
-                logger.info(f"Table already has {len(existing_rows)} rows, will use incremental sync")
-    except Exception as e:
-        logger.error(f"Error during initial Google Sheets check: {e}")
 
     logger.info("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
