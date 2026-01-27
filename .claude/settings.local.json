@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"c:\\\\Users\\\\Андрей\\\\computer\\\\Desktop\\\\documents_bot-main\")"
+    ]
+  }
+}
