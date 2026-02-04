@@ -5,7 +5,11 @@
 from google_auth_oauthlib.flow import InstalledAppFlow
 import json
 
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
+SCOPES = [
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets'
+]
 
 def main():
     print("🔐 Генерация OAuth токена для Google Drive...")
