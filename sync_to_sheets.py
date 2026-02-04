@@ -93,6 +93,7 @@ class Database:
                 c.phone,
                 c.telegram_id,
                 c.drive_folder_id,
+                c.drive_folder_url,
                 c.created_at,
                 ARRAY_AGG(DISTINCT d.document_type) FILTER (WHERE d.document_type IS NOT NULL) as document_types
             FROM docbot.clients c
@@ -167,15 +168,15 @@ class SheetsManager:
         ).execute()
         return result.get('values', [])
 
-    def update_checkboxes(self, row_number, document_types, has_folder):
+    def update_checkboxes(self, row_number, document_types, folder_url):
         """Оновити чекбокси для конкретного рядка"""
         updates = []
 
-        # Папка створена
+        # Папка - посилання на Drive (не чекбокс)
         folder_col = self._col_letter(COLUMNS['folder_created'])
         updates.append({
             'range': f"'{self.sheet_name}'!{folder_col}{row_number}",
-            'values': [[True if has_folder else False]]
+            'values': [[folder_url if folder_url else '']]
         })
 
         # Документи
@@ -211,10 +212,10 @@ class SheetsManager:
         else:
             date_str = datetime.now().strftime('%d.%m')
 
-        # Telegram username
+        # Telegram - посилання на профіль через ID
         telegram = ''
         if client.get('telegram_id'):
-            telegram = f"@user{client['telegram_id']}"  # Можна замінити на реальний username якщо зберігається
+            telegram = f"tg://user?id={client['telegram_id']}"
 
         # Базові дані (тільки текстові поля, чекбокси окремо)
         row_data = [''] * (max(COLUMNS.values()) + 1)
@@ -235,11 +236,11 @@ class SheetsManager:
 
         logger.info(f"Added new client at row {new_row}: {client['full_name']}")
 
-        # Оновлюємо чекбокси
+        # Оновлюємо чекбокси та папку
         self.update_checkboxes(
             new_row,
             client.get('document_types', []),
-            bool(client.get('drive_folder_id'))
+            client.get('drive_folder_url', '')
         )
 
         return new_row
@@ -317,11 +318,11 @@ def sync_to_sheets():
             found_row = normalized_phones.get(client_phone_normalized)
 
             if found_row:
-                # Оновлюємо чекбокси
+                # Оновлюємо чекбокси та папку
                 sheets.update_checkboxes(
                     found_row,
                     client.get('document_types', []),
-                    bool(client.get('drive_folder_id'))
+                    client.get('drive_folder_url', '')
                 )
                 updated += 1
             else:
