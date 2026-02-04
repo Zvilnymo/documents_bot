@@ -2871,6 +2871,30 @@ def main():
 
     logger.info("Daily reminder job scheduled for 14:03 Kyiv time")
 
+    # Google Sheets sync job (кожні 4 години)
+    try:
+        from sync_to_sheets import sync_to_sheets
+
+        async def sheets_sync_job(context):
+            """Фонова задача синхронізації з Google Sheets"""
+            try:
+                logger.info("Starting Google Sheets sync...")
+                sync_to_sheets()
+                logger.info("Google Sheets sync completed")
+            except Exception as e:
+                logger.error(f"Google Sheets sync error: {e}")
+
+        # Запускаємо синхронізацію кожні 4 години
+        job_queue.run_repeating(
+            sheets_sync_job,
+            interval=4 * 60 * 60,  # 4 години в секундах
+            first=60,  # Перший запуск через 1 хвилину після старту
+            name="google_sheets_sync"
+        )
+        logger.info("Google Sheets sync job scheduled (every 4 hours)")
+    except Exception as e:
+        logger.warning(f"Google Sheets sync not configured: {e}")
+
     logger.info("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
