@@ -1,6 +1,6 @@
 """
 Google Sheets Sync - синхронізація даних клієнтів з PostgreSQL в Google Sheets
-Запускається як окремий Background Worker на Render кожні 4 години
+ОПТИМІЗОВАНА ВЕРСІЯ - batch updates замість окремих запитів
 """
 import os
 import json
@@ -19,15 +19,13 @@ from googleapiclient.discovery import build
 # ============================================================================
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-GOOGLE_SPREADSHEET_ID = os.getenv('GOOGLE_SPREADSHEET_ID')  # ID таблиці з URL
-GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Таблиця1')  # Назва листа
+GOOGLE_SPREADSHEET_ID = os.getenv('GOOGLE_SPREADSHEET_ID')
+GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME', 'Sheet1')
 GOOGLE_OAUTH_TOKEN = os.getenv('GOOGLE_OAUTH_TOKEN')
 GOOGLE_CREDENTIALS_FILE = os.getenv('GOOGLE_CREDENTIALS_FILE')
 
-# Інтервал синхронізації (4 години в секундах)
 SYNC_INTERVAL = int(os.getenv('SYNC_INTERVAL', 4 * 60 * 60))
 
-# Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -35,43 +33,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# МАППІНГ ДОКУМЕНТІВ НА КОЛОНКИ GOOGLE SHEETS
+# МАППІНГ КОЛОНОК
 # ============================================================================
 
-# Колонки в Google Sheets (0-indexed) - налаштуй під свою таблицю!
 COLUMNS = {
-    'date': 0,           # A - Дата
-    'full_name': 1,      # B - ПІБ
-    'phone': 2,          # C - ТЕЛЕФОН
-    'telegram': 3,       # D - Телеграм
-    'folder_created': 4, # E - Чи створені папки на диску
-    'passport': 5,       # F - паспорт\ІПН
-    'ecp': 6,            # G - КЛЮЧ ЕЦП
-    'registration': 7,   # H - Довідка про зареєстрованих осіб
-    'family_income': 8,  # I - Довідка про доходи
-    'credit_contracts': 9,   # J - Кредитні договори
-    'debt_certificates': 10, # K - Довідки про заборгованості
-    'expenses': 11,      # L - Підвердження витрат
-    'bank_statements': 12,   # M - Банківські виписки
-    'workbook': 13,      # N - Трудова книжка
-    'story': 14,         # O - Історія
+    'date': 0,           # A
+    'full_name': 1,      # B
+    'phone': 2,          # C
+    'telegram': 3,       # D
+    'folder_created': 4, # E
+    'passport': 5,       # F
+    'ecp': 6,            # G
+    'registration': 7,   # H
+    'family_income': 8,  # I
+    'credit_contracts': 9,   # J
+    'debt_certificates': 10, # K
+    'expenses': 11,      # L
+    'bank_statements': 12,   # M
+    'workbook': 13,      # N
+    'story': 14,         # O
 }
 
-# Типи документів з БД -> колонки в sheets
-DOC_TYPE_TO_COLUMN = {
-    'passport': 'passport',
-    'ecp': 'ecp',
-    'registration': 'registration',
-    'family_income': 'family_income',
-    'credit_contracts': 'credit_contracts',
-    'debt_certificates': 'debt_certificates',
-    'expenses': 'expenses',
-    'bank_statements': 'bank_statements',
-    'workbook': 'workbook',
-    'story': 'story',
-}
+DOC_TYPES = ['passport', 'ecp', 'registration', 'family_income', 'credit_contracts',
+             'debt_certificates', 'expenses', 'bank_statements', 'workbook', 'story']
 
-# Перша рядок з даними (після заголовків)
 FIRST_DATA_ROW = 2
 
 # ============================================================================
@@ -85,16 +70,10 @@ class Database:
         logger.info("Database connected")
 
     def get_all_clients_with_documents(self):
-        """Отримати всіх клієнтів з їх документами"""
         query = """
             SELECT
-                c.id,
-                c.full_name,
-                c.phone,
-                c.telegram_id,
-                c.drive_folder_id,
-                c.drive_folder_url,
-                c.created_at,
+                c.id, c.full_name, c.phone, c.telegram_id,
+                c.drive_folder_id, c.drive_folder_url, c.created_at,
                 ARRAY_AGG(DISTINCT d.document_type) FILTER (WHERE d.document_type IS NOT NULL) as document_types
             FROM docbot.clients c
             LEFT JOIN docbot.documents d ON c.id = d.client_id
@@ -114,9 +93,8 @@ class Database:
 
 class SheetsManager:
     def __init__(self):
-        # Використовуємо ті ж credentials що і для Drive
         if GOOGLE_OAUTH_TOKEN:
-            logger.info("Using OAuth 2.0 credentials for Sheets")
+            logger.info("Using OAuth 2.0 credentials")
             token_data = json.loads(GOOGLE_OAUTH_TOKEN)
             credentials = Credentials(
                 token=token_data.get('token'),
@@ -128,91 +106,38 @@ class SheetsManager:
                         'https://www.googleapis.com/auth/drive']
             )
         elif GOOGLE_CREDENTIALS_FILE:
-            logger.info("Using Service Account credentials for Sheets")
+            logger.info("Using Service Account credentials")
             credentials = service_account.Credentials.from_service_account_file(
                 GOOGLE_CREDENTIALS_FILE,
                 scopes=['https://www.googleapis.com/auth/spreadsheets',
                         'https://www.googleapis.com/auth/drive']
             )
         else:
-            raise ValueError("No Google credentials configured!")
+            raise ValueError("No Google credentials!")
 
         self.service = build('sheets', 'v4', credentials=credentials)
         self.spreadsheet_id = GOOGLE_SPREADSHEET_ID
         self.sheet_name = GOOGLE_SHEET_NAME
-        logger.info(f"Sheets API initialized for spreadsheet: {GOOGLE_SPREADSHEET_ID}")
+        logger.info(f"Sheets API initialized: {GOOGLE_SPREADSHEET_ID}")
 
     def get_existing_phones(self):
-        """Отримати список телефонів які вже є в таблиці"""
-        range_name = f"'{self.sheet_name}'!C:C"  # Колонка C - телефони
+        """Отримати телефони з таблиці"""
+        range_name = f"'{self.sheet_name}'!C:C"
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=range_name
         ).execute()
 
-        values = result.get('values', [])
         phones = {}
-        for i, row in enumerate(values):
-            if row and i >= FIRST_DATA_ROW - 1:  # Пропускаємо заголовки
+        for i, row in enumerate(result.get('values', [])):
+            if row and i >= FIRST_DATA_ROW - 1:
                 phone = str(row[0]).strip() if row[0] else ''
                 if phone:
-                    phones[phone] = i + 1  # Номер рядка (1-indexed)
+                    phones[phone] = i + 1
         return phones
 
-    def get_all_data(self):
-        """Отримати всі дані з таблиці"""
-        range_name = f"'{self.sheet_name}'!A:Z"
-        result = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=range_name
-        ).execute()
-        return result.get('values', [])
-
-    def update_checkboxes(self, row_number, document_types, folder_url):
-        """Оновити чекбокси та папку для конкретного рядка"""
-        updates = []
-
-        # Папка - посилання на Drive
-        folder_col = self._col_letter(COLUMNS['folder_created'])
-        updates.append({
-            'range': f"'{self.sheet_name}'!{folder_col}{row_number}",
-            'values': [[folder_url if folder_url else '']]
-        })
-
-        # Документи
-        for doc_type, col_name in DOC_TYPE_TO_COLUMN.items():
-            if col_name in COLUMNS:
-                col_letter = self._col_letter(COLUMNS[col_name])
-                has_doc = doc_type in (document_types or [])
-                updates.append({
-                    'range': f"'{self.sheet_name}'!{col_letter}{row_number}",
-                    'values': [[True if has_doc else False]]
-                })
-
-        # Batch update
-        if updates:
-            body = {
-                'valueInputOption': 'USER_ENTERED',
-                'data': updates
-            }
-            self.service.spreadsheets().values().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body=body
-            ).execute()
-            logger.info(f"Updated checkboxes for row {row_number}")
-
-    def get_sheet_id(self):
-        """Отримати ID листа (не spreadsheet, а конкретного sheet)"""
-        metadata = self.service.spreadsheets().get(
-            spreadsheetId=self.spreadsheet_id
-        ).execute()
-        for sheet in metadata.get('sheets', []):
-            if sheet['properties']['title'] == self.sheet_name:
-                return sheet['properties']['sheetId']
-        return 0  # Default sheet
-
-    def ensure_rows_available(self, needed_row):
-        """Автоматично розширити таблицю якщо потрібно більше рядків"""
+    def ensure_rows(self, needed_rows):
+        """Розширити таблицю якщо потрібно"""
         try:
             metadata = self.service.spreadsheets().get(
                 spreadsheetId=self.spreadsheet_id
@@ -220,168 +145,162 @@ class SheetsManager:
 
             for sheet in metadata.get('sheets', []):
                 if sheet['properties']['title'] == self.sheet_name:
-                    current_rows = sheet['properties']['gridProperties']['rowCount']
-
-                    if needed_row > current_rows:
-                        # Додаємо рядки
-                        rows_to_add = needed_row - current_rows + 100  # +100 про запас
-                        request = {
-                            'requests': [{
+                    current = sheet['properties']['gridProperties']['rowCount']
+                    if needed_rows > current:
+                        to_add = needed_rows - current + 50
+                        self.service.spreadsheets().batchUpdate(
+                            spreadsheetId=self.spreadsheet_id,
+                            body={'requests': [{
                                 'appendDimension': {
                                     'sheetId': sheet['properties']['sheetId'],
                                     'dimension': 'ROWS',
-                                    'length': rows_to_add
+                                    'length': to_add
                                 }
-                            }]
-                        }
-                        self.service.spreadsheets().batchUpdate(
-                            spreadsheetId=self.spreadsheet_id,
-                            body=request
+                            }]}
                         ).execute()
-                        logger.info(f"Added {rows_to_add} rows to sheet (now {current_rows + rows_to_add} total)")
-                    return True
-            return False
+                        logger.info(f"Added {to_add} rows")
+                    return
         except Exception as e:
             logger.error(f"Error ensuring rows: {e}")
-            return False
 
-    def add_new_client(self, client, last_row):
-        """Додати нового клієнта в таблицю"""
-        new_row = last_row + 1
-
-        # Автоматично розширюємо таблицю якщо потрібно
-        self.ensure_rows_available(new_row)
-
-        # Формуємо дату
-        created_at = client['created_at']
-        if created_at:
-            date_str = created_at.strftime('%d.%m') if hasattr(created_at, 'strftime') else str(created_at)[:5]
-        else:
-            date_str = datetime.now().strftime('%d.%m')
-
-        # Telegram - посилання на профіль через ID
-        telegram = ''
-        if client.get('telegram_id'):
-            telegram = f"tg://user?id={client['telegram_id']}"
-
-        # Базові дані (тільки текстові поля, чекбокси окремо)
-        row_data = [''] * (max(COLUMNS.values()) + 1)
-        row_data[COLUMNS['date']] = date_str
-        row_data[COLUMNS['full_name']] = client['full_name'] or ''
-        row_data[COLUMNS['phone']] = client['phone'] or ''
-        row_data[COLUMNS['telegram']] = telegram
-
-        # Записуємо базові дані
-        last_col = self._col_letter(max(COLUMNS.values()))
-        range_name = f"'{self.sheet_name}'!A{new_row}:{last_col}{new_row}"
-        self.service.spreadsheets().values().update(
+    def batch_update(self, updates):
+        """Виконати batch update"""
+        if not updates:
+            return
+        self.service.spreadsheets().values().batchUpdate(
             spreadsheetId=self.spreadsheet_id,
-            range=range_name,
-            valueInputOption='USER_ENTERED',
-            body={'values': [row_data]}
+            body={'valueInputOption': 'USER_ENTERED', 'data': updates}
         ).execute()
 
-        logger.info(f"Added new client at row {new_row}: {client['full_name']}")
-
-        # Оновлюємо чекбокси та папку
-        self.update_checkboxes(
-            new_row,
-            client.get('document_types', []),
-            client.get('drive_folder_url', '')
-        )
-
-        return new_row
-
-    def _col_letter(self, col_index):
-        """Конвертувати індекс колонки в букву (0 -> A, 1 -> B, etc.)"""
+    def _col_letter(self, idx):
         result = ''
-        while col_index >= 0:
-            result = chr(col_index % 26 + ord('A')) + result
-            col_index = col_index // 26 - 1
+        while idx >= 0:
+            result = chr(idx % 26 + ord('A')) + result
+            idx = idx // 26 - 1
         return result
 
 # ============================================================================
-# SYNC LOGIC
+# SYNC
 # ============================================================================
 
 def normalize_phone(phone):
-    """Нормалізувати телефон для порівняння"""
     if not phone:
         return ''
-    # Видаляємо все крім цифр
     digits = ''.join(filter(str.isdigit, str(phone)))
-    # Якщо починається з 380 - повертаємо як є
     if digits.startswith('380'):
         return digits
-    # Якщо починається з 0 - додаємо 38
     if digits.startswith('0'):
         return '38' + digits
-    # Якщо 10 цифр - додаємо 380
     if len(digits) == 10:
         return '380' + digits
     return digits
 
 def sync_to_sheets():
-    """Головна функція синхронізації"""
+    """Головна функція - BATCH синхронізація"""
     logger.info("=" * 50)
-    logger.info("Starting sync to Google Sheets...")
-    logger.info(f"Time: {datetime.now()}")
+    logger.info("Starting BATCH sync to Google Sheets...")
+    start_time = datetime.now()
 
     try:
         db = Database()
         sheets = SheetsManager()
 
-        # Отримуємо клієнтів з БД
+        # 1. Отримуємо дані
         clients = db.get_all_clients_with_documents()
-        logger.info(f"Found {len(clients)} clients in database")
+        logger.info(f"Found {len(clients)} clients in DB")
 
-        # Отримуємо існуючі телефони в таблиці
         existing_phones = sheets.get_existing_phones()
-        logger.info(f"Found {len(existing_phones)} existing entries in sheet")
+        logger.info(f"Found {len(existing_phones)} in sheet")
 
-        # Створюємо нормалізований маппінг і знаходимо останній заповнений рядок
-        normalized_phones = {}
+        # Нормалізуємо телефони
+        normalized_existing = {}
         last_row = FIRST_DATA_ROW - 1
-
         for phone, row in existing_phones.items():
-            normalized = normalize_phone(phone)
-            if normalized:
-                normalized_phones[normalized] = row
-            # Знаходимо максимальний номер рядка (останній заповнений)
+            norm = normalize_phone(phone)
+            if norm:
+                normalized_existing[norm] = row
             if row > last_row:
                 last_row = row
 
-        logger.info(f"Last filled row: {last_row}")
+        logger.info(f"Last row: {last_row}")
 
-        updated = 0
-        added = 0
+        # 2. Готуємо дані для batch update
+        all_updates = []
+        new_rows = []
 
         for client in clients:
             phone = client['phone']
             if not phone:
                 continue
 
-            # Нормалізуємо телефон клієнта
-            client_phone_normalized = normalize_phone(phone)
+            phone_norm = normalize_phone(phone)
+            doc_types = client.get('document_types') or []
+            folder_url = client.get('drive_folder_url') or ''
 
-            # Шукаємо в існуючих
-            found_row = normalized_phones.get(client_phone_normalized)
+            existing_row = normalized_existing.get(phone_norm)
 
-            if found_row:
-                # Оновлюємо чекбокси та папку
-                sheets.update_checkboxes(
-                    found_row,
-                    client.get('document_types', []),
-                    client.get('drive_folder_url', '')
-                )
-                updated += 1
+            if existing_row:
+                # Оновлюємо тільки папку і чекбокси
+                # Папка
+                all_updates.append({
+                    'range': f"'{sheets.sheet_name}'!E{existing_row}",
+                    'values': [[folder_url]]
+                })
+                # Чекбокси (F-O)
+                checkboxes = []
+                for doc in DOC_TYPES:
+                    checkboxes.append(True if doc in doc_types else False)
+                all_updates.append({
+                    'range': f"'{sheets.sheet_name}'!F{existing_row}:O{existing_row}",
+                    'values': [checkboxes]
+                })
             else:
-                # Додаємо нового клієнта
-                last_row = sheets.add_new_client(client, last_row)
-                normalized_phones[client_phone_normalized] = last_row
-                added += 1
+                # Новий клієнт - додаємо в список
+                created = client['created_at']
+                date_str = created.strftime('%d.%m') if created else datetime.now().strftime('%d.%m')
+                telegram = f"tg://user?id={client['telegram_id']}" if client.get('telegram_id') else ''
 
-        logger.info(f"Sync completed: {updated} updated, {added} added")
+                row_data = [
+                    date_str,
+                    client['full_name'] or '',
+                    phone,
+                    telegram,
+                    folder_url
+                ]
+                # Чекбокси
+                for doc in DOC_TYPES:
+                    row_data.append(True if doc in doc_types else False)
+
+                new_rows.append(row_data)
+                normalized_existing[phone_norm] = last_row + len(new_rows)
+
+        # 3. Розширюємо таблицю якщо потрібно
+        total_rows_needed = last_row + len(new_rows)
+        sheets.ensure_rows(total_rows_needed)
+
+        # 4. Додаємо нові рядки одним запитом
+        if new_rows:
+            start_row = last_row + 1
+            end_row = last_row + len(new_rows)
+            sheets.service.spreadsheets().values().update(
+                spreadsheetId=sheets.spreadsheet_id,
+                range=f"'{sheets.sheet_name}'!A{start_row}:O{end_row}",
+                valueInputOption='USER_ENTERED',
+                body={'values': new_rows}
+            ).execute()
+            logger.info(f"Added {len(new_rows)} new clients (rows {start_row}-{end_row})")
+
+        # 5. Оновлюємо існуючі записи batch'ем
+        if all_updates:
+            # Розбиваємо на чанки по 100 (ліміт API)
+            chunk_size = 100
+            for i in range(0, len(all_updates), chunk_size):
+                chunk = all_updates[i:i+chunk_size]
+                sheets.batch_update(chunk)
+            logger.info(f"Updated {len(all_updates)//2} existing clients")
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Sync completed in {elapsed:.1f}s: {len(new_rows)} added, {len(all_updates)//2} updated")
         db.close()
 
     except Exception as e:
@@ -389,24 +308,16 @@ def sync_to_sheets():
         raise
 
 def run_scheduler():
-    """Запуск з інтервалом"""
-    logger.info(f"Starting scheduler with interval: {SYNC_INTERVAL} seconds ({SYNC_INTERVAL/3600:.1f} hours)")
-
+    logger.info(f"Scheduler: every {SYNC_INTERVAL/3600:.1f} hours")
     while True:
         try:
             sync_to_sheets()
         except Exception as e:
             logger.error(f"Sync failed: {e}")
-
         logger.info(f"Next sync in {SYNC_INTERVAL/3600:.1f} hours...")
         time.sleep(SYNC_INTERVAL)
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
 if __name__ == '__main__':
-    # Якщо передано аргумент --once - запустити один раз
     import sys
     if '--once' in sys.argv:
         sync_to_sheets()
