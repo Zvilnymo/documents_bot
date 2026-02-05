@@ -169,10 +169,10 @@ class SheetsManager:
         return result.get('values', [])
 
     def update_checkboxes(self, row_number, document_types, folder_url):
-        """Оновити чекбокси для конкретного рядка"""
+        """Оновити чекбокси та папку для конкретного рядка"""
         updates = []
 
-        # Папка - посилання на Drive (не чекбокс)
+        # Папка - посилання на Drive
         folder_col = self._col_letter(COLUMNS['folder_created'])
         updates.append({
             'range': f"'{self.sheet_name}'!{folder_col}{row_number}",
@@ -292,16 +292,19 @@ def sync_to_sheets():
         existing_phones = sheets.get_existing_phones()
         logger.info(f"Found {len(existing_phones)} existing entries in sheet")
 
-        # Створюємо нормалізований маппінг
+        # Створюємо нормалізований маппінг і знаходимо останній заповнений рядок
         normalized_phones = {}
+        last_row = FIRST_DATA_ROW - 1
+
         for phone, row in existing_phones.items():
             normalized = normalize_phone(phone)
             if normalized:
                 normalized_phones[normalized] = row
+            # Знаходимо максимальний номер рядка (останній заповнений)
+            if row > last_row:
+                last_row = row
 
-        # Отримуємо всі дані для визначення останнього рядка
-        all_data = sheets.get_all_data()
-        last_row = len(all_data) if all_data else FIRST_DATA_ROW - 1
+        logger.info(f"Last filled row: {last_row}")
 
         updated = 0
         added = 0
