@@ -201,9 +201,56 @@ class SheetsManager:
             ).execute()
             logger.info(f"Updated checkboxes for row {row_number}")
 
+    def get_sheet_id(self):
+        """Отримати ID листа (не spreadsheet, а конкретного sheet)"""
+        metadata = self.service.spreadsheets().get(
+            spreadsheetId=self.spreadsheet_id
+        ).execute()
+        for sheet in metadata.get('sheets', []):
+            if sheet['properties']['title'] == self.sheet_name:
+                return sheet['properties']['sheetId']
+        return 0  # Default sheet
+
+    def ensure_rows_available(self, needed_row):
+        """Автоматично розширити таблицю якщо потрібно більше рядків"""
+        try:
+            metadata = self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id
+            ).execute()
+
+            for sheet in metadata.get('sheets', []):
+                if sheet['properties']['title'] == self.sheet_name:
+                    current_rows = sheet['properties']['gridProperties']['rowCount']
+
+                    if needed_row > current_rows:
+                        # Додаємо рядки
+                        rows_to_add = needed_row - current_rows + 100  # +100 про запас
+                        request = {
+                            'requests': [{
+                                'appendDimension': {
+                                    'sheetId': sheet['properties']['sheetId'],
+                                    'dimension': 'ROWS',
+                                    'length': rows_to_add
+                                }
+                            }]
+                        }
+                        self.service.spreadsheets().batchUpdate(
+                            spreadsheetId=self.spreadsheet_id,
+                            body=request
+                        ).execute()
+                        logger.info(f"Added {rows_to_add} rows to sheet (now {current_rows + rows_to_add} total)")
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Error ensuring rows: {e}")
+            return False
+
     def add_new_client(self, client, last_row):
         """Додати нового клієнта в таблицю"""
         new_row = last_row + 1
+
+        # Автоматично розширюємо таблицю якщо потрібно
+        self.ensure_rows_available(new_row)
 
         # Формуємо дату
         created_at = client['created_at']
