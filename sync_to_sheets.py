@@ -1,12 +1,13 @@
 """
 Google Sheets Sync - синхронізація даних клієнтів з PostgreSQL в Google Sheets
-ОПТИМІЗОВАНА ВЕРСІЯ - batch updates замість окремих запитів
+ОПТИМІЗОВАНА ВЕРСІЯ - batch updates, дедуплікація по телефону
 """
 import os
 import json
 import logging
 import time
 from datetime import datetime
+from collections import defaultdict
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -121,20 +122,26 @@ class SheetsManager:
         logger.info(f"Sheets API initialized: {GOOGLE_SPREADSHEET_ID}")
 
     def get_existing_phones(self):
-        """Отримати телефони з таблиці"""
-        range_name = f"'{self.sheet_name}'!C:C"
+        """Отримати телефони з таблиці з відстеженням дублікатів"""
+        range_name = f"'{self.sheet_name}'!A:O"
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=range_name
         ).execute()
 
-        phones = {}
+        # normalized_phone -> list of row numbers (для виявлення дублікатів)
+        phones = defaultdict(list)
         for i, row in enumerate(result.get('values', [])):
-            if row and i >= FIRST_DATA_ROW - 1:
-                phone = str(row[0]).strip() if row[0] else ''
+            if i < FIRST_DATA_ROW - 1:
+                continue
+            # Колонка C (індекс 2) - телефон
+            if row and len(row) > 2:
+                phone = str(row[2]).strip() if row[2] else ''
                 if phone:
-                    phones[phone] = i + 1
-        return phones
+                    norm = normalize_phone(phone)
+                    if norm:
+                        phones[norm].append(i + 1)
+        return dict(phones)
 
     def ensure_rows(self, needed_rows):
         """Розширити таблицю якщо потрібно"""
@@ -196,7 +203,7 @@ def normalize_phone(phone):
     return digits
 
 def sync_to_sheets():
-    """Головна функція - BATCH синхронізація"""
+    """Головна функція - BATCH синхронізація з дедуплікацією"""
     logger.info("=" * 50)
     logger.info("Starting BATCH sync to Google Sheets...")
     start_time = datetime.now()
@@ -205,80 +212,130 @@ def sync_to_sheets():
         db = Database()
         sheets = SheetsManager()
 
-        # 1. Отримуємо дані
+        # 1. Отримуємо дані з БД
         clients = db.get_all_clients_with_documents()
         logger.info(f"Found {len(clients)} clients in DB")
 
-        existing_phones = sheets.get_existing_phones()
-        logger.info(f"Found {len(existing_phones)} in sheet")
-
-        # Нормалізуємо телефони
-        normalized_existing = {}
-        last_row = FIRST_DATA_ROW - 1
-        for phone, row in existing_phones.items():
-            norm = normalize_phone(phone)
-            if norm:
-                normalized_existing[norm] = row
-            if row > last_row:
-                last_row = row
-
-        logger.info(f"Last row: {last_row}")
-
-        # 2. Готуємо дані для batch update
-        all_updates = []
-        new_rows = []
-
+        # 2. Групуємо клієнтів по нормалізованому телефону (об'єднуємо документи)
+        clients_by_phone = {}
         for client in clients:
             phone = client['phone']
             if not phone:
                 continue
-
             phone_norm = normalize_phone(phone)
-            doc_types = client.get('document_types') or []
-            folder_url = client.get('drive_folder_url') or ''
+            if not phone_norm:
+                continue
+
+            doc_types = set(client.get('document_types') or [])
+
+            if phone_norm not in clients_by_phone:
+                clients_by_phone[phone_norm] = {
+                    'full_name': client['full_name'] or '',
+                    'telegram_id': client.get('telegram_id'),
+                    'created_at': client['created_at'],
+                    'drive_folder_url': client.get('drive_folder_url') or '',
+                    'doc_types': doc_types,
+                }
+            else:
+                # Об'єднуємо документи від різних клієнтів з тим самим телефоном
+                clients_by_phone[phone_norm]['doc_types'].update(doc_types)
+                # Використовуємо folder_url якщо у поточного його немає
+                if not clients_by_phone[phone_norm]['drive_folder_url'] and client.get('drive_folder_url'):
+                    clients_by_phone[phone_norm]['drive_folder_url'] = client['drive_folder_url']
+
+        logger.info(f"Unique phones in DB: {len(clients_by_phone)}")
+
+        # 3. Отримуємо телефони з таблиці (з відстеженням дублікатів)
+        existing_phones = sheets.get_existing_phones()
+        logger.info(f"Found {len(existing_phones)} unique phones in sheet")
+
+        # 4. Обробляємо дублікати: залишаємо перший рядок, очищуємо решту
+        normalized_existing = {}
+        last_row = FIRST_DATA_ROW - 1
+        duplicate_clears = []
+        duplicates_found = 0
+
+        for phone_norm, rows in existing_phones.items():
+            # Зберігаємо перший рядок як основний
+            normalized_existing[phone_norm] = rows[0]
+            # Решта - дублікати, очищуємо їх
+            for dup_row in rows[1:]:
+                duplicate_clears.append({
+                    'range': f"'{sheets.sheet_name}'!A{dup_row}:Z{dup_row}",
+                    'values': [[''] * 26]
+                })
+                duplicates_found += 1
+            # Відстежуємо максимальний рядок
+            for r in rows:
+                if r > last_row:
+                    last_row = r
+
+        if duplicates_found:
+            logger.info(f"Found {duplicates_found} duplicate rows to clear")
+
+        logger.info(f"Last row: {last_row}")
+
+        # 5. Готуємо дані для batch update
+        all_updates = []
+        new_rows = []
+
+        for phone_norm, data in clients_by_phone.items():
+            doc_types = data['doc_types']
+            folder_url = data['drive_folder_url']
 
             existing_row = normalized_existing.get(phone_norm)
 
             if existing_row:
-                # Оновлюємо тільки папку і чекбокси
+                # Оновлюємо: ім'я, телефон (нормалізований), папку і чекбокси
+                # Телефон перезаписуємо нормалізованим для консистентності
+                all_updates.append({
+                    'range': f"'{sheets.sheet_name}'!C{existing_row}",
+                    'values': [[phone_norm]]
+                })
                 # Папка
                 all_updates.append({
                     'range': f"'{sheets.sheet_name}'!E{existing_row}",
                     'values': [[folder_url]]
                 })
                 # Чекбокси (F-O)
-                checkboxes = []
-                for doc in DOC_TYPES:
-                    checkboxes.append(True if doc in doc_types else False)
+                checkboxes = [doc in doc_types for doc in DOC_TYPES]
                 all_updates.append({
                     'range': f"'{sheets.sheet_name}'!F{existing_row}:O{existing_row}",
                     'values': [checkboxes]
                 })
             else:
-                # Новий клієнт - додаємо в список
-                created = client['created_at']
-                date_str = created.strftime('%d.%m') if created else datetime.now().strftime('%d.%m')
-                telegram = f"tg://user?id={client['telegram_id']}" if client.get('telegram_id') else ''
+                # Новий клієнт
+                created = data['created_at']
+                date_str = created.strftime('%d.%m.%Y') if created else datetime.now().strftime('%d.%m.%Y')
+                telegram = f"tg://user?id={data['telegram_id']}" if data.get('telegram_id') else ''
 
                 row_data = [
                     date_str,
-                    client['full_name'] or '',
-                    phone,
+                    data['full_name'],
+                    phone_norm,
                     telegram,
                     folder_url
                 ]
                 # Чекбокси
                 for doc in DOC_TYPES:
-                    row_data.append(True if doc in doc_types else False)
+                    row_data.append(doc in doc_types)
 
                 new_rows.append(row_data)
                 normalized_existing[phone_norm] = last_row + len(new_rows)
 
-        # 3. Розширюємо таблицю якщо потрібно
+        # 6. Очищуємо дублікати
+        if duplicate_clears:
+            chunk_size = 100
+            for i in range(0, len(duplicate_clears), chunk_size):
+                chunk = duplicate_clears[i:i+chunk_size]
+                sheets.batch_update(chunk)
+            logger.info(f"Cleared {duplicates_found} duplicate rows")
+
+        # 7. Розширюємо таблицю якщо потрібно
         total_rows_needed = last_row + len(new_rows)
         sheets.ensure_rows(total_rows_needed)
 
-        # 4. Додаємо нові рядки одним запитом
+        # 8. Додаємо нові рядки одним запитом
         if new_rows:
             start_row = last_row + 1
             end_row = last_row + len(new_rows)
@@ -290,17 +347,17 @@ def sync_to_sheets():
             ).execute()
             logger.info(f"Added {len(new_rows)} new clients (rows {start_row}-{end_row})")
 
-        # 5. Оновлюємо існуючі записи batch'ем
+        # 9. Оновлюємо існуючі записи batch'ем
         if all_updates:
-            # Розбиваємо на чанки по 100 (ліміт API)
             chunk_size = 100
             for i in range(0, len(all_updates), chunk_size):
                 chunk = all_updates[i:i+chunk_size]
                 sheets.batch_update(chunk)
-            logger.info(f"Updated {len(all_updates)//2} existing clients")
+            logger.info(f"Updated {len(all_updates)//3} existing clients")
 
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Sync completed in {elapsed:.1f}s: {len(new_rows)} added, {len(all_updates)//2} updated")
+        logger.info(f"Sync completed in {elapsed:.1f}s: {len(new_rows)} added, "
+                     f"{len(all_updates)//3} updated, {duplicates_found} duplicates cleared")
         db.close()
 
     except Exception as e:
