@@ -431,6 +431,16 @@ class Database:
         query = "UPDATE docbot.clients SET status = %s, last_activity = CURRENT_TIMESTAMP WHERE id = %s"
         self.execute(query, (status, client_id))
 
+    def update_client_screening(self, client_id, has_gambling_crypto, is_fraud_victim, has_sold_property, income_over_30k):
+        query = """
+            UPDATE docbot.clients
+            SET has_gambling_crypto = %s, is_fraud_victim = %s,
+                has_sold_property = %s, income_over_30k = %s,
+                last_activity = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """
+        self.execute(query, (has_gambling_crypto, is_fraud_victim, has_sold_property, income_over_30k, client_id))
+
     def update_last_activity(self, client_id):
         query = "UPDATE docbot.clients SET last_activity = CURRENT_TIMESTAMP WHERE id = %s"
         self.execute(query, (client_id,))
@@ -752,7 +762,7 @@ class DriveManager:
 # ============================================================================
 
 # Стани
-WAITING_NAME, WAITING_PHONE = range(2)
+WAITING_NAME, WAITING_PHONE, WAITING_Q1, WAITING_Q2, WAITING_Q3, WAITING_Q4 = range(6)
 
 # Стани для анкети декларації
 (DECL_START, DECL_QUESTION, DECL_FILES) = range(3)
@@ -768,6 +778,31 @@ CALLBACK_DECL_START = "decl_start"
 CALLBACK_DECL_SKIP = "decl_skip"
 CALLBACK_DECL_PREVIOUS = "decl_previous"
 CALLBACK_DECL_MENU = "decl_menu"
+CALLBACK_SCREENING_YES = "screening_yes"
+CALLBACK_SCREENING_NO = "screening_no"
+
+SCREENING_QUESTIONS = [
+    {
+        'key': 'has_gambling_crypto',
+        'question': 'Чи користувалися Ви онлайн-казино, букмекерськими ставками або інвестували в криптовалюту / біржі?',
+        'state': 2,  # WAITING_Q1
+    },
+    {
+        'key': 'is_fraud_victim',
+        'question': 'Чи ставали Ви жертвою шахрайських дій, пов\'язаних із грошовими коштами?',
+        'state': 3,  # WAITING_Q2
+    },
+    {
+        'key': 'has_sold_property',
+        'question': 'Чи продавали Ви протягом останніх трьох років рухоме або нерухоме майно?',
+        'state': 4,  # WAITING_Q3
+    },
+    {
+        'key': 'income_over_30k',
+        'question': 'Чи перевищує Ваш середній щомісячний дохід 30 000 грн?',
+        'state': 5,  # WAITING_Q4
+    },
+]
 
 db = Database()
 drive = DriveManager()
@@ -1139,6 +1174,7 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_PHONE
 
+    context.user_data['phone'] = phone
     full_name = context.user_data['full_name']
     client = db.create_client(update.effective_user.id, full_name, phone)
 
@@ -1160,7 +1196,82 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    context.user_data['client_id'] = client['id']
+    context.user_data['screening_answers'] = {}
+
     await update.message.reply_text(
+        f"👤 {full_name}, дякуємо!\n\n"
+        f"Перш ніж ми розпочнемо збір документів, дайте відповідь на кілька коротких запитань. "
+        f"Це допоможе нашим юристам краще підготувати вашу справу 📋",
+        parse_mode='HTML',
+        reply_markup=ReplyKeyboardMarkup([["Продовжити"]], resize_keyboard=True, one_time_keyboard=True)
+    )
+
+    return await send_screening_question(update, context, 0)
+
+async def send_screening_question(update, context, q_index):
+    """Відправити скринінг-питання з кнопками Так/Ні"""
+    question = SCREENING_QUESTIONS[q_index]
+    context.user_data['screening_q_index'] = q_index
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Так", callback_data=CALLBACK_SCREENING_YES),
+            InlineKeyboardButton("❌ Ні", callback_data=CALLBACK_SCREENING_NO)
+        ]
+    ])
+
+    text = f"<b>Питання {q_index + 1} з {len(SCREENING_QUESTIONS)}</b>\n\n{question['question']}"
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, parse_mode='HTML', reply_markup=keyboard)
+
+    return SCREENING_QUESTIONS[q_index]['state']
+
+async def handle_screening_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробити відповідь на скринінг-питання"""
+    query = update.callback_query
+    await query.answer()
+
+    q_index = context.user_data.get('screening_q_index', 0)
+    answer = query.data == CALLBACK_SCREENING_YES
+    question_key = SCREENING_QUESTIONS[q_index]['key']
+    context.user_data['screening_answers'][question_key] = answer
+
+    # Відмічаємо відповідь у повідомленні
+    answer_text = "✅ Так" if answer else "❌ Ні"
+    original_text = query.message.text or query.message.text_html
+    try:
+        await query.edit_message_text(
+            f"{original_text}\n\n<b>Ваша відповідь:</b> {answer_text}",
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+    next_index = q_index + 1
+
+    if next_index < len(SCREENING_QUESTIONS):
+        return await send_screening_question(update, context, next_index)
+
+    # Всі питання відповідено - зберігаємо і завершуємо реєстрацію
+    answers = context.user_data['screening_answers']
+    client_id = context.user_data['client_id']
+    db.update_client_screening(
+        client_id,
+        has_gambling_crypto=answers.get('has_gambling_crypto', False),
+        is_fraud_victim=answers.get('is_fraud_victim', False),
+        has_sold_property=answers.get('has_sold_property', False),
+        income_over_30k=answers.get('income_over_30k', False)
+    )
+
+    full_name = context.user_data['full_name']
+    phone = context.user_data.get('phone', '')
+    folders = context.user_data.get('folders', {})
+
+    await query.message.reply_text(
         f"✅ Реєстрація завершена!\n\n"
         f"👤 ПІБ: {full_name}\n"
         f"📱 Телефон: {phone}\n\n"
@@ -1176,13 +1287,14 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_keyboard()
     )
 
+    folder_link = folders.get('client', {}).get('webViewLink', '')
     await notify_admins(
         f"🆕 Новий клієнт зареєстрований!\n\n"
         f"👤 {full_name}\n"
         f"📱 {phone}\n"
         f"🆔 Telegram: {update.effective_user.id}\n"
         f"📊 Статус: in_progress (0/9 документів)\n"
-        f"📁 <a href=\"{folders['client']['webViewLink']}\">Відкрити папку на Drive</a>"
+        f"📁 <a href=\"{folder_link}\">Відкрити папку на Drive</a>"
     )
 
     return ConversationHandler.END
@@ -2767,6 +2879,11 @@ def main():
         from telegram import Bot
         notification_bot = Bot(token=NOTIFICATION_BOT_TOKEN)
 
+    screening_handler = CallbackQueryHandler(
+        handle_screening_answer,
+        pattern=f"^({CALLBACK_SCREENING_YES}|{CALLBACK_SCREENING_NO})$"
+    )
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -2774,7 +2891,11 @@ def main():
             WAITING_PHONE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_phone),
                 MessageHandler(filters.CONTACT, receive_phone)
-            ]
+            ],
+            WAITING_Q1: [screening_handler],
+            WAITING_Q2: [screening_handler],
+            WAITING_Q3: [screening_handler],
+            WAITING_Q4: [screening_handler],
         },
         fallbacks=[CommandHandler('start', start)]
     )

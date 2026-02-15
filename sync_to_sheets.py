@@ -52,11 +52,17 @@ COLUMNS = {
     'expenses': 11,      # L
     'bank_statements': 12,   # M
     'workbook': 13,      # N
-    'story': 14,         # O
+    'story': 14,              # O
+    'has_gambling_crypto': 15, # P
+    'is_fraud_victim': 16,    # Q
+    'has_sold_property': 17,  # R
+    'income_over_30k': 18,    # S
 }
 
 DOC_TYPES = ['passport', 'ecp', 'registration', 'family_income', 'credit_contracts',
              'debt_certificates', 'expenses', 'bank_statements', 'workbook', 'story']
+
+SCREENING_FIELDS = ['has_gambling_crypto', 'is_fraud_victim', 'has_sold_property', 'income_over_30k']
 
 FIRST_DATA_ROW = 2
 
@@ -75,6 +81,8 @@ class Database:
             SELECT
                 c.id, c.full_name, c.phone, c.telegram_id,
                 c.drive_folder_id, c.drive_folder_url, c.created_at,
+                c.has_gambling_crypto, c.is_fraud_victim,
+                c.has_sold_property, c.income_over_30k,
                 ARRAY_AGG(DISTINCT d.document_type) FILTER (WHERE d.document_type IS NOT NULL) as document_types
             FROM docbot.clients c
             LEFT JOIN docbot.documents d ON c.id = d.client_id
@@ -123,7 +131,7 @@ class SheetsManager:
 
     def get_existing_phones(self):
         """Отримати телефони з таблиці з відстеженням дублікатів"""
-        range_name = f"'{self.sheet_name}'!A:O"
+        range_name = f"'{self.sheet_name}'!A:S"
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=range_name
@@ -229,12 +237,18 @@ def sync_to_sheets():
             doc_types = set(client.get('document_types') or [])
 
             if phone_norm not in clients_by_phone:
+                screening = {}
+                for field in SCREENING_FIELDS:
+                    val = client.get(field)
+                    if val is not None:
+                        screening[field] = val
                 clients_by_phone[phone_norm] = {
                     'full_name': client['full_name'] or '',
                     'telegram_id': client.get('telegram_id'),
                     'created_at': client['created_at'],
                     'drive_folder_url': client.get('drive_folder_url') or '',
                     'doc_types': doc_types,
+                    'screening': screening,
                 }
             else:
                 # Об'єднуємо документи від різних клієнтів з тим самим телефоном
@@ -242,6 +256,11 @@ def sync_to_sheets():
                 # Використовуємо folder_url якщо у поточного його немає
                 if not clients_by_phone[phone_norm]['drive_folder_url'] and client.get('drive_folder_url'):
                     clients_by_phone[phone_norm]['drive_folder_url'] = client['drive_folder_url']
+                # Заповнюємо скринінг якщо у попереднього не було
+                for field in SCREENING_FIELDS:
+                    val = client.get(field)
+                    if val is not None and field not in clients_by_phone[phone_norm]['screening']:
+                        clients_by_phone[phone_norm]['screening'][field] = val
 
         logger.info(f"Unique phones in DB: {len(clients_by_phone)}")
 
@@ -285,9 +304,20 @@ def sync_to_sheets():
 
             existing_row = normalized_existing.get(phone_norm)
 
+            screening = data.get('screening', {})
+            screening_values = [screening.get(f, '') for f in SCREENING_FIELDS]
+            # Конвертуємо boolean в Так/Ні для таблиці
+            screening_display = []
+            for v in screening_values:
+                if v is True:
+                    screening_display.append('Так')
+                elif v is False:
+                    screening_display.append('Ні')
+                else:
+                    screening_display.append('')
+
             if existing_row:
-                # Оновлюємо: ім'я, телефон (нормалізований), папку і чекбокси
-                # Телефон перезаписуємо нормалізованим для консистентності
+                # Оновлюємо: телефон (нормалізований), папку, чекбокси, скринінг
                 all_updates.append({
                     'range': f"'{sheets.sheet_name}'!C{existing_row}",
                     'values': [[phone_norm]]
@@ -302,6 +332,11 @@ def sync_to_sheets():
                 all_updates.append({
                     'range': f"'{sheets.sheet_name}'!F{existing_row}:O{existing_row}",
                     'values': [checkboxes]
+                })
+                # Скринінг (P-S)
+                all_updates.append({
+                    'range': f"'{sheets.sheet_name}'!P{existing_row}:S{existing_row}",
+                    'values': [screening_display]
                 })
             else:
                 # Новий клієнт
@@ -319,6 +354,8 @@ def sync_to_sheets():
                 # Чекбокси
                 for doc in DOC_TYPES:
                     row_data.append(doc in doc_types)
+                # Скринінг
+                row_data.extend(screening_display)
 
                 new_rows.append(row_data)
                 normalized_existing[phone_norm] = last_row + len(new_rows)
@@ -341,7 +378,7 @@ def sync_to_sheets():
             end_row = last_row + len(new_rows)
             sheets.service.spreadsheets().values().update(
                 spreadsheetId=sheets.spreadsheet_id,
-                range=f"'{sheets.sheet_name}'!A{start_row}:O{end_row}",
+                range=f"'{sheets.sheet_name}'!A{start_row}:S{end_row}",
                 valueInputOption='USER_ENTERED',
                 body={'values': new_rows}
             ).execute()
@@ -353,11 +390,11 @@ def sync_to_sheets():
             for i in range(0, len(all_updates), chunk_size):
                 chunk = all_updates[i:i+chunk_size]
                 sheets.batch_update(chunk)
-            logger.info(f"Updated {len(all_updates)//3} existing clients")
+            logger.info(f"Updated {len(all_updates)//4} existing clients")
 
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"Sync completed in {elapsed:.1f}s: {len(new_rows)} added, "
-                     f"{len(all_updates)//3} updated, {duplicates_found} duplicates cleared")
+                     f"{len(all_updates)//4} updated, {duplicates_found} duplicates cleared")
         db.close()
 
     except Exception as e:
