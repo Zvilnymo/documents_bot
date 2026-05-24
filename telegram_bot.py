@@ -693,6 +693,15 @@ class Database:
         """
         self.execute(query, (status, rejection_reason, receipt_id))
 
+    def get_pending_receipt_invoice_ids(self, client_id):
+        """Return set of invoice_bitrix_ids that have a pending receipt for this client."""
+        query = """
+            SELECT DISTINCT invoice_bitrix_id FROM docbot.payment_receipts
+            WHERE client_id = %s AND status = 'pending'
+        """
+        rows = self.execute(query, (client_id,), fetch=True) or []
+        return {r['invoice_bitrix_id'] for r in rows}
+
     def get_all_pending_receipts(self):
         query = """
             SELECT r.*, c.telegram_id, c.full_name, c.phone
@@ -3198,9 +3207,10 @@ def generate_payment_schedule_image(invoices, client_name):
     C_WHITE     = (255, 255, 255)
 
     STATUS_COLORS = {
-        'paid':    ((22,  163,  74), C_WHITE, 'Оплачено'),
-        'active':  ((37,   99, 235), C_WHITE, 'В обробцi'),
-        'waiting': ((100, 116, 139), C_WHITE, 'Очiкується'),
+        'paid':       ((22,  163,  74), C_WHITE, 'Оплачено'),
+        'processing': ((37,   99, 235), C_WHITE, 'В обробцi'),
+        'overdue':    ((220,  38,  38), C_WHITE, 'Прострочено'),
+        'waiting':    ((100, 116, 139), C_WHITE, 'Очiкується'),
     }
 
     # ── шрифты ───────────────────────────────────────────────────────────────
@@ -3257,18 +3267,14 @@ def generate_payment_schedule_image(invoices, client_name):
         else:
             due_date = None
 
-        if BitrixClient.is_paid_stage(stage_id):
+        if inv.get('_status_key'):
+            skey = inv['_status_key']
+        elif BitrixClient.is_paid_stage(stage_id):
             skey = 'paid'
-        elif BitrixClient.is_rejected_stage(stage_id):
-            skey = 'waiting'
-        elif due_date and due_date <= today:
-            skey = 'active'
+        elif due_date and due_date < today:
+            skey = 'overdue'
         else:
             skey = 'waiting'
-
-        # Якщо чек вже відправлено — показуємо "В обробці"
-        if skey == 'waiting' and due_date and due_date <= today + timedelta(days=7):
-            skey = 'active'
 
         s_bg, s_fg, s_label = STATUS_COLORS[skey]
 
@@ -3356,6 +3362,26 @@ async def show_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await loading_msg.edit_text(msg, reply_markup=reply_markup)
             return
 
+        # Визначаємо статус для кожного рахунку (враховуємо pending чеки)
+        from datetime import date as _date_cls
+        today = _date_cls.today()
+        pending_ids = db.get_pending_receipt_invoice_ids(client['id'])
+
+        for inv in invoices:
+            sid = inv.get('stage_id') or ''
+            due_raw = inv.get('invoice_date')
+            due = due_raw.date() if hasattr(due_raw, 'date') else (
+                _date_cls.fromisoformat(str(due_raw)[:10]) if due_raw else None
+            )
+            if BitrixClient.is_paid_stage(sid):
+                inv['_status_key'] = 'paid'
+            elif str(inv['id']) in pending_ids:
+                inv['_status_key'] = 'processing'
+            elif due and due < today:
+                inv['_status_key'] = 'overdue'
+            else:
+                inv['_status_key'] = 'waiting'
+
         # Удаляем старую картинку если она есть
         old_img_id = context.user_data.get('invoice_image_msg_id')
         if old_img_id:
@@ -3373,20 +3399,23 @@ async def show_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as img_err:
             logger.warning(f"Could not generate payment schedule image: {img_err}")
 
-        # Формуємо текстовий список з кнопками для переходу до кожного рахунку
+        # Формуємо текстовий список з кнопками
         message = "💳 <b>Ваші рахунки</b>\nНатисніть на рахунок щоб надіслати чек оплати:\n\n"
         buttons = []
 
-        for inv in invoices:
+        for idx, inv in enumerate(invoices, 1):
             try:
                 amount_str = f"{float(inv.get('amount') or 0):,.0f} грн".replace(',', ' ')
             except Exception:
                 amount_str = f"{inv.get('amount', 0)} грн"
-            number = str(inv['id'])
-            title = inv.get('title') or f"Рахунок #{number}"
+
+            status_icons = {
+                'paid': '✅', 'processing': '⏳', 'overdue': '🔴', 'waiting': '🔵'
+            }
+            icon = status_icons.get(inv.get('_status_key', 'waiting'), '🔵')
 
             buttons.append([InlineKeyboardButton(
-                f"📄 {title} — {amount_str}",
+                f"{icon} Платіж №{idx} — {amount_str}",
                 callback_data=f"{CALLBACK_INVOICE_PREFIX}{inv['id']}"
             )])
 
