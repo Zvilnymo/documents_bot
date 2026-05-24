@@ -703,13 +703,13 @@ class Database:
         return self.execute(query, fetch=True) or []
 
     def get_invoices_by_client_phone(self, phone):
-        """Get invoices from ETL DB for a client matched by phone (digits-only comparison)."""
+        """Get invoices from ETL DB matched by last 9 digits of phone (format-agnostic)."""
         query = """
             SELECT fi.*
             FROM crm.fact_invoices fi
             JOIN crm.dim_contacts dc ON fi.contact_id = dc.id
-            WHERE regexp_replace(dc.phone, '[^0-9]', '', 'g')
-                = regexp_replace(%s, '[^0-9]', '', 'g')
+            WHERE RIGHT(regexp_replace(dc.phone, '[^0-9]', '', 'g'), 9)
+                = RIGHT(regexp_replace(%s,       '[^0-9]', '', 'g'), 9)
             ORDER BY fi.date_create DESC
         """
         return self.execute(query, (phone,), fetch=True) or []
@@ -727,8 +727,8 @@ class Database:
             FROM crm.fact_invoices fi
             JOIN crm.dim_contacts dc ON fi.contact_id = dc.id
             JOIN docbot.clients c
-              ON regexp_replace(c.phone, '[^0-9]', '', 'g')
-               = regexp_replace(dc.phone, '[^0-9]', '', 'g')
+              ON RIGHT(regexp_replace(c.phone,  '[^0-9]', '', 'g'), 9)
+               = RIGHT(regexp_replace(dc.phone, '[^0-9]', '', 'g'), 9)
             WHERE fi.stage_id NOT IN ('DT31_1:UC_WW75SB', 'DT31_1:P', 'DT31_1:UC_FKX3CW', 'DT31_1:D')
               AND fi.invoice_date IS NOT NULL
               AND c.telegram_id IS NOT NULL
