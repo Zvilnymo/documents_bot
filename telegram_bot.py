@@ -8,10 +8,8 @@ import tempfile
 import base64
 import json
 import pytz
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Telegram
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,6 +30,9 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 
 # AI Document Validator
 from ai_document_validator import validator as ai_validator
+
+# Bitrix24
+from bitrix_client import BitrixClient
 
 # ============================================================================
 # КОНФІГУРАЦІЯ
@@ -59,6 +60,10 @@ GOOGLE_OAUTH_TOKEN = os.getenv('GOOGLE_OAUTH_TOKEN')  # OAuth токен (JSON s
 
 # Settings
 REMINDER_DAYS = int(os.getenv('REMINDER_DAYS', 3))
+
+# Bitrix24
+BITRIX_WEBHOOK_URL = os.getenv('BITRIX_WEBHOOK_URL')       # https://company.bitrix24.ua/rest/1/xxxxx/
+BITRIX_MANAGER_BITRIX_ID = os.getenv('BITRIX_MANAGER_BITRIX_ID', '')  # Bitrix user ID of the manager to notify
 
 # Підпапки на Drive
 SUBFOLDERS = {
@@ -619,6 +624,142 @@ class Database:
         """
         return self.execute(query, fetch=True)
 
+    # Payment Receipts
+    def create_payment_receipts_table(self):
+        query = """
+            CREATE TABLE IF NOT EXISTS docbot.payment_receipts (
+                id SERIAL PRIMARY KEY,
+                client_id INTEGER REFERENCES docbot.clients(id) ON DELETE CASCADE,
+                invoice_bitrix_id VARCHAR(50) NOT NULL,
+                invoice_number VARCHAR(100),
+                invoice_amount DECIMAL(12,2),
+                currency VARCHAR(10) DEFAULT 'UAH',
+                drive_file_url TEXT,
+                drive_file_id VARCHAR(255),
+                status VARCHAR(20) DEFAULT 'pending',
+                rejection_reason TEXT,
+                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        self.execute(query)
+
+    def save_payment_receipt(self, client_id, invoice_bitrix_id, invoice_number,
+                             invoice_amount, currency, drive_file_url, drive_file_id):
+        query = """
+            INSERT INTO docbot.payment_receipts
+            (client_id, invoice_bitrix_id, invoice_number, invoice_amount, currency, drive_file_url, drive_file_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """
+        result = self.execute(
+            query,
+            (client_id, invoice_bitrix_id, invoice_number, invoice_amount, currency, drive_file_url, drive_file_id),
+            fetch=True
+        )
+        return result[0]['id'] if result else None
+
+    def get_payment_receipts_by_invoice(self, client_id, invoice_bitrix_id):
+        query = """
+            SELECT * FROM docbot.payment_receipts
+            WHERE client_id = %s AND invoice_bitrix_id = %s
+            ORDER BY submitted_at DESC
+        """
+        return self.execute(query, (client_id, invoice_bitrix_id), fetch=True) or []
+
+    def get_pending_receipts_by_invoice(self, invoice_bitrix_id):
+        query = """
+            SELECT r.*, c.telegram_id, c.full_name FROM docbot.payment_receipts r
+            JOIN docbot.clients c ON r.client_id = c.id
+            WHERE r.invoice_bitrix_id = %s AND r.status = 'pending'
+        """
+        return self.execute(query, (invoice_bitrix_id,), fetch=True) or []
+
+    def get_receipt_by_id(self, receipt_id):
+        query = """
+            SELECT r.*, c.telegram_id, c.full_name, c.phone
+            FROM docbot.payment_receipts r
+            JOIN docbot.clients c ON r.client_id = c.id
+            WHERE r.id = %s
+        """
+        result = self.execute(query, (receipt_id,), fetch=True)
+        return result[0] if result else None
+
+    def update_receipt_status(self, receipt_id, status, rejection_reason=None):
+        query = """
+            UPDATE docbot.payment_receipts
+            SET status = %s, rejection_reason = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """
+        self.execute(query, (status, rejection_reason, receipt_id))
+
+    def get_all_pending_receipts(self):
+        query = """
+            SELECT r.*, c.telegram_id, c.full_name, c.phone
+            FROM docbot.payment_receipts r
+            JOIN docbot.clients c ON r.client_id = c.id
+            WHERE r.status = 'pending'
+        """
+        return self.execute(query, fetch=True) or []
+
+    def get_invoices_by_client_phone(self, phone):
+        """Get invoices from ETL DB for a client matched by phone."""
+        query = """
+            SELECT fi.*
+            FROM crm.fact_invoices fi
+            JOIN crm.dim_contacts dc ON fi.contact_id = dc.id
+            WHERE dc.phone = %s
+            ORDER BY fi.date_create DESC
+        """
+        return self.execute(query, (phone,), fetch=True) or []
+
+    def get_invoice_by_id(self, invoice_id):
+        """Get a single invoice from ETL DB."""
+        query = "SELECT * FROM crm.fact_invoices WHERE id = %s"
+        result = self.execute(query, (int(invoice_id),), fetch=True)
+        return result[0] if result else None
+
+    def get_unpaid_invoices_for_registered_clients(self):
+        """Get invoices that are not paid/rejected, for clients registered in the bot."""
+        query = """
+            SELECT fi.*, c.telegram_id, c.id AS client_db_id
+            FROM crm.fact_invoices fi
+            JOIN crm.dim_contacts dc ON fi.contact_id = dc.id
+            JOIN docbot.clients c ON c.phone = dc.phone
+            WHERE fi.stage_id NOT IN ('DT31_1:UC_WW75SB', 'DT31_1:P', 'DT31_1:UC_FKX3CW', 'DT31_1:D')
+              AND fi.invoice_date IS NOT NULL
+              AND c.telegram_id IS NOT NULL
+        """
+        return self.execute(query, fetch=True) or []
+
+    def create_invoice_reminders_table(self):
+        query = """
+            CREATE TABLE IF NOT EXISTS docbot.invoice_reminders_log (
+                id SERIAL PRIMARY KEY,
+                client_id INTEGER REFERENCES docbot.clients(id) ON DELETE CASCADE,
+                invoice_bitrix_id VARCHAR(50) NOT NULL,
+                reminder_type VARCHAR(50) NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        self.execute(query)
+
+    def get_last_invoice_reminder(self, client_id, invoice_bitrix_id):
+        query = """
+            SELECT * FROM docbot.invoice_reminders_log
+            WHERE client_id = %s AND invoice_bitrix_id = %s
+            ORDER BY sent_at DESC LIMIT 1
+        """
+        result = self.execute(query, (client_id, str(invoice_bitrix_id)), fetch=True)
+        return result[0] if result else None
+
+    def log_invoice_reminder(self, client_id, invoice_bitrix_id, reminder_type):
+        query = """
+            INSERT INTO docbot.invoice_reminders_log (client_id, invoice_bitrix_id, reminder_type)
+            VALUES (%s, %s, %s)
+        """
+        self.execute(query, (client_id, str(invoice_bitrix_id), reminder_type))
+
 # ============================================================================
 # GOOGLE DRIVE
 # ============================================================================
@@ -797,6 +938,11 @@ CALLBACK_DECL_MENU = "decl_menu"
 CALLBACK_SCREENING_YES = "screening_yes"
 CALLBACK_SCREENING_NO = "screening_no"
 
+# Invoice callbacks
+CALLBACK_INVOICES = "invoices_list"
+CALLBACK_INVOICE_PREFIX = "invoice_"   # invoice_<bitrix_id>
+CALLBACK_RECEIPT_PREFIX = "receipt_"   # receipt_<bitrix_id>
+
 SCREENING_QUESTIONS = [
     {
         'key': 'has_gambling_crypto',
@@ -823,6 +969,9 @@ SCREENING_QUESTIONS = [
 db = Database()
 drive = DriveManager()
 notification_bot = None
+
+# Bitrix24 client (None if not configured)
+bitrix = BitrixClient(BITRIX_WEBHOOK_URL) if BITRIX_WEBHOOK_URL else None
 
 # Словник для зберігання message_id чек-листів клієнтів
 # client_telegram_id -> (chat_id, message_id)
@@ -1582,6 +1731,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Route to receipt handler when in receipt-upload mode
+    if 'uploading_receipt_for_invoice' in context.user_data:
+        await handle_receipt_file(update, context)
+        return
+
     client, admin_id = get_active_client(update, context)
 
     if not client:
@@ -2141,7 +2295,8 @@ def get_progress_bar(current, total, length=20):
 
 def get_main_keyboard():
     keyboard = [
-        [KeyboardButton("📋 Чек-лист документів")]
+        [KeyboardButton("📋 Чек-лист документів")],
+        [KeyboardButton("💳 Рахунки")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -3001,6 +3156,566 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
 # ============================================================================
+# INVOICE HANDLERS (Bitrix24)
+# ============================================================================
+
+def _load_font(size):
+    """Load a Cyrillic-capable TrueType font, fall back to PIL default."""
+    from PIL import ImageFont
+    candidates = [
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+        'C:/Windows/Fonts/arial.ttf',
+        'C:/Windows/Fonts/segoeui.ttf',
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def generate_payment_schedule_image(invoices, client_name):
+    """Generate a payment schedule table as a PNG image using Pillow."""
+    from PIL import Image, ImageDraw
+    from datetime import date as _date
+    import io
+
+    # ── палитра ──────────────────────────────────────────────────────────────
+    C_BG        = (248, 250, 252)   # светлый фон страницы
+    C_HEADER    = (30,  64, 175)    # тёмно-синий заголовок
+    C_COL_HDR   = (59,  130, 246)   # синяя шапка таблицы
+    C_ROW_ODD   = (255, 255, 255)
+    C_ROW_EVEN  = (239, 246, 255)
+    C_LINE      = (203, 213, 225)
+    C_TEXT      = (15,  23,  42)
+    C_TEXT_MUTE = (100, 116, 139)
+    C_WHITE     = (255, 255, 255)
+
+    STATUS_COLORS = {
+        'paid':    ((22,  163,  74), C_WHITE, 'Оплачено'),
+        'active':  ((37,   99, 235), C_WHITE, 'В обробцi'),
+        'waiting': ((100, 116, 139), C_WHITE, 'Очiкується'),
+    }
+
+    # ── шрифты ───────────────────────────────────────────────────────────────
+    f_title  = _load_font(22)
+    f_sub    = _load_font(14)
+    f_hdr    = _load_font(15)
+    f_cell   = _load_font(14)
+    f_status = _load_font(13)
+
+    # ── размеры ──────────────────────────────────────────────────────────────
+    PAD          = 24
+    TITLE_H      = 80
+    COL_HDR_H    = 44
+    ROW_H        = 52
+    FOOTER_H     = 48
+    COL_W        = [44, 0, 170, 140, 150]   # №, Назва (растянется), Сума, Дата, Статус
+    IMG_W        = 860
+    COL_W[1]     = IMG_W - PAD * 2 - sum(COL_W) + COL_W[1]  # Назва = остаток
+    total_rows   = len(invoices)
+    IMG_H        = TITLE_H + COL_HDR_H + ROW_H * total_rows + FOOTER_H + PAD
+
+    img  = Image.new('RGB', (IMG_W, IMG_H), C_BG)
+    draw = ImageDraw.Draw(img)
+
+    today = _date.today()
+
+    # ── заголовок ────────────────────────────────────────────────────────────
+    draw.rectangle([0, 0, IMG_W, TITLE_H], fill=C_HEADER)
+    draw.text((PAD, 14), "Графiк платежiв", fill=C_WHITE, font=f_title)
+    draw.text((PAD, 46), f"{client_name}   |   Станом на {today.strftime('%d.%m.%Y')}", fill=(147, 197, 253), font=f_sub)
+
+    # ── шапка таблицы ────────────────────────────────────────────────────────
+    y = TITLE_H
+    draw.rectangle([0, y, IMG_W, y + COL_HDR_H], fill=C_COL_HDR)
+    HEADERS = ['№', 'Рахунок', 'Сума (грн)', 'Дата оплати', 'Статус']
+    x = PAD
+    for col_idx, (w, hdr) in enumerate(zip(COL_W, HEADERS)):
+        draw.text((x + 6, y + 14), hdr, fill=C_WHITE, font=f_hdr)
+        x += w
+
+    # ── строки ───────────────────────────────────────────────────────────────
+    y += COL_HDR_H
+    total_amount = 0.0
+
+    for row_idx, inv in enumerate(invoices):
+        bg = C_ROW_ODD if row_idx % 2 == 0 else C_ROW_EVEN
+        draw.rectangle([0, y, IMG_W, y + ROW_H], fill=bg)
+
+        # Определяем статус
+        stage_id = inv.get('stage_id') or ''
+        due_raw  = inv.get('invoice_date')
+        if due_raw:
+            due_date = due_raw.date() if hasattr(due_raw, 'date') else _date.fromisoformat(str(due_raw)[:10])
+        else:
+            due_date = None
+
+        if BitrixClient.is_paid_stage(stage_id):
+            skey = 'paid'
+        elif BitrixClient.is_rejected_stage(stage_id):
+            skey = 'waiting'
+        elif due_date and due_date <= today:
+            skey = 'active'
+        else:
+            skey = 'waiting'
+
+        # Якщо чек вже відправлено — показуємо "В обробці"
+        if skey == 'waiting' and due_date and due_date <= today + timedelta(days=7):
+            skey = 'active'
+
+        s_bg, s_fg, s_label = STATUS_COLORS[skey]
+
+        try:
+            amount_val = float(inv.get('amount') or 0)
+        except Exception:
+            amount_val = 0.0
+        total_amount += amount_val
+        amount_str = f"{amount_val:,.0f}".replace(',', ' ')
+
+        title_text = f"Платiж №{row_idx + 1}"
+        due_str    = due_date.strftime('%d.%m.%Y') if due_date else '—'
+
+        cell_y = y + 16
+        x = PAD
+
+        # №
+        draw.text((x + 6, cell_y), str(row_idx + 1), fill=C_TEXT_MUTE, font=f_cell)
+        x += COL_W[0]
+
+        draw.text((x + 6, cell_y), title_text, fill=C_TEXT, font=f_cell)
+        x += COL_W[1]
+
+        # Сума
+        draw.text((x + 6, cell_y), amount_str, fill=C_TEXT, font=f_cell)
+        x += COL_W[2]
+
+        # Дата
+        date_color = (220, 38, 38) if skey == 'overdue' else (217, 119, 6) if skey == 'soon' else C_TEXT
+        draw.text((x + 6, cell_y), due_str, fill=date_color, font=f_cell)
+        x += COL_W[3]
+
+        # Статус — цветной бейдж
+        badge_w, badge_h = 110, 26
+        bx, by = x + 6, y + (ROW_H - badge_h) // 2
+        draw.rounded_rectangle([bx, by, bx + badge_w, by + badge_h], radius=6, fill=s_bg)
+        draw.text((bx + 8, by + 5), s_label, fill=s_fg, font=f_status)
+
+        # разделитель строк
+        draw.line([(0, y + ROW_H - 1), (IMG_W, y + ROW_H - 1)], fill=C_LINE, width=1)
+        y += ROW_H
+
+    # ── футер с суммой ────────────────────────────────────────────────────────
+    draw.rectangle([0, y, IMG_W, y + FOOTER_H + PAD], fill=(241, 245, 249))
+    draw.text((PAD, y + 14),
+              f"Разом до сплати:  {total_amount:,.0f} грн".replace(',', ' '),
+              fill=C_HEADER, font=f_hdr)
+
+    buf = io.BytesIO()
+    img.save(buf, format='PNG', optimize=True)
+    buf.seek(0)
+    return buf
+
+
+async def show_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show client invoices from the ETL database."""
+    query = update.callback_query
+    client, _ = get_active_client(update, context)
+
+    if not client:
+        msg = "❌ Ви ще не зареєстровані. Натисніть /start"
+        if query:
+            await query.answer(msg)
+        else:
+            await update.message.reply_text(msg)
+        return
+
+    if query:
+        await query.answer()
+        await query.edit_message_text("⏳ Завантажую рахунки...")
+    else:
+        loading_msg = await update.message.reply_text("⏳ Завантажую рахунки...")
+
+    try:
+        invoices = db.get_invoices_by_client_phone(client['phone'])
+
+        if not invoices:
+            msg = "📭 У вас поки немає рахунків."
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Оновити", callback_data=CALLBACK_INVOICES)]])
+            if query:
+                await query.edit_message_text(msg, reply_markup=reply_markup)
+            else:
+                await loading_msg.edit_text(msg, reply_markup=reply_markup)
+            return
+
+        # Генеруємо картинку-графік платежів
+        try:
+            img_buf = generate_payment_schedule_image(invoices, client['full_name'])
+            chat_id = update.effective_chat.id
+            await context.bot.send_photo(chat_id=chat_id, photo=img_buf)
+        except Exception as img_err:
+            logger.warning(f"Could not generate payment schedule image: {img_err}")
+
+        # Формуємо текстовий список з кнопками для переходу до кожного рахунку
+        message = "💳 <b>Ваші рахунки</b>\nНатисніть на рахунок щоб надіслати чек оплати:\n\n"
+        buttons = []
+
+        for inv in invoices:
+            try:
+                amount_str = f"{float(inv.get('amount') or 0):,.0f} грн".replace(',', ' ')
+            except Exception:
+                amount_str = f"{inv.get('amount', 0)} грн"
+            number = str(inv['id'])
+            title = inv.get('title') or f"Рахунок #{number}"
+
+            buttons.append([InlineKeyboardButton(
+                f"📄 {title} — {amount_str}",
+                callback_data=f"{CALLBACK_INVOICE_PREFIX}{inv['id']}"
+            )])
+
+        buttons.append([InlineKeyboardButton("🔄 Оновити", callback_data=CALLBACK_INVOICES)])
+
+        reply_markup = InlineKeyboardMarkup(buttons)
+        if query:
+            await query.edit_message_text(message, parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            await loading_msg.edit_text(message, parse_mode='HTML', reply_markup=reply_markup)
+
+    except Exception as e:
+        logger.error(f"Error fetching invoices: {e}", exc_info=True)
+        msg = "❌ Помилка завантаження рахунків. Спробуйте пізніше."
+        if query:
+            await query.edit_message_text(msg)
+        else:
+            await loading_msg.edit_text(msg)
+
+
+async def handle_invoice_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show single invoice detail with receipt upload button."""
+    query = update.callback_query
+    await query.answer()
+
+    invoice_id = query.data[len(CALLBACK_INVOICE_PREFIX):]
+    context.user_data.pop('uploading_receipt_for_invoice', None)
+
+    client, _ = get_active_client(update, context)
+    if not client:
+        await query.edit_message_text("❌ Не авторизовано")
+        return
+
+    await query.edit_message_text("⏳ Завантажую рахунок...")
+
+    invoice = db.get_invoice_by_id(invoice_id)
+
+    if not invoice:
+        await query.edit_message_text(
+            "❌ Рахунок не знайдено.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« До списку рахунків", callback_data=CALLBACK_INVOICES)
+            ]])
+        )
+        return
+
+    stage_id = invoice.get('stage_id') or ''
+    status = BitrixClient.get_stage_name(stage_id)
+    try:
+        amount_str = f"{float(invoice.get('amount') or 0):,.2f} UAH".replace(',', ' ')
+    except Exception:
+        amount_str = f"{invoice.get('amount', 0)} UAH"
+    number = str(invoice['id'])
+    title = invoice.get('title') or f"Рахунок #{number}"
+    due_date = invoice.get('invoice_date')
+
+    if due_date:
+        try:
+            due_str = due_date.strftime('%d.%m.%Y') if hasattr(due_date, 'strftime') else str(due_date)[:10]
+        except Exception:
+            due_str = 'не вказано'
+    else:
+        due_str = 'не вказано'
+
+    message = (
+        f"📄 <b>{title}</b>\n\n"
+        f"💰 Сума: <b>{amount_str}</b>\n"
+        f"📅 Сплатити до: <b>{due_str}</b>\n"
+        f"Статус: {status}\n"
+    )
+
+    pending_receipts = db.get_payment_receipts_by_invoice(client['id'], str(invoice_id))
+    has_pending = any(r['status'] == 'pending' for r in pending_receipts)
+
+    buttons = []
+
+    if BitrixClient.is_paid_stage(stage_id):
+        message += "\n✅ <i>Рахунок оплачено</i>"
+    elif has_pending:
+        message += "\n⏳ <i>Чек передано менеджеру на перевірку</i>"
+    else:
+        buttons.append([InlineKeyboardButton(
+            "📤 Надіслати чек оплати",
+            callback_data=f"{CALLBACK_RECEIPT_PREFIX}{invoice_id}"
+        )])
+
+    buttons.append([InlineKeyboardButton("« До списку рахунків", callback_data=CALLBACK_INVOICES)])
+
+    await query.edit_message_text(
+        message,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def handle_receipt_upload_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User clicked 'Send receipt' — ask them to upload the file."""
+    query = update.callback_query
+    await query.answer()
+
+    invoice_id = query.data[len(CALLBACK_RECEIPT_PREFIX):]
+    context.user_data['uploading_receipt_for_invoice'] = invoice_id
+
+    await query.edit_message_text(
+        "📤 <b>Надіслати чек оплати</b>\n\n"
+        "Будь ласка, надішліть фото або файл чека оплати.\n\n"
+        "💡 Підійде фото квитанції, PDF виписки або скріншот підтвердження платежу.",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Скасувати", callback_data=f"{CALLBACK_INVOICE_PREFIX}{invoice_id}")
+        ]])
+    )
+
+
+async def handle_receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process receipt file sent by the client."""
+    client, _ = get_active_client(update, context)
+    if not client:
+        await update.message.reply_text("❌ Ви ще не зареєстровані.")
+        return
+
+    invoice_id = context.user_data.get('uploading_receipt_for_invoice')
+    if not invoice_id:
+        return
+
+    if not update.message.document and not update.message.photo:
+        await update.message.reply_text("⚠️ Будь ласка, надішліть фото або файл чека.")
+        return
+
+    if update.message.document:
+        file = update.message.document
+        original_file_name = file.file_name
+    else:
+        file = update.message.photo[-1]
+        original_file_name = f"receipt_{file.file_id}.jpg"
+
+    loading_msg = await update.message.reply_text("⏳ Обробляю чек...")
+
+    try:
+        tg_file = await context.bot.get_file(file.file_id)
+        temp_path = os.path.join(tempfile.gettempdir(), original_file_name)
+        await tg_file.download_to_drive(temp_path)
+
+        # Upload to Google Drive in "Чеки" subfolder
+        folders = drive.create_client_folder_structure(client['full_name'], client['phone'])
+        receipts_folder = drive.get_or_create_folder('Чеки', folders['client']['id'])
+        drive_file = drive.upload_file(temp_path, receipts_folder['id'], f"Чек_{invoice_id}_{original_file_name}")
+        os.remove(temp_path)
+
+        # Get invoice details from DB
+        inv_db = db.get_invoice_by_id(invoice_id)
+        invoice_number = str(invoice_id)
+        invoice_amount = 0.0
+        manager_bitrix_id = None
+        if inv_db:
+            invoice_number = inv_db.get('title') or str(invoice_id)
+            try:
+                invoice_amount = float(inv_db.get('amount') or 0)
+            except Exception:
+                pass
+            manager_bitrix_id = inv_db.get('manager_id')
+
+        # Save to DB
+        receipt_id = db.save_payment_receipt(
+            client_id=client['id'],
+            invoice_bitrix_id=str(invoice_id),
+            invoice_number=invoice_number,
+            invoice_amount=invoice_amount,
+            currency='UAH',
+            drive_file_url=drive_file['webViewLink'],
+            drive_file_id=drive_file['id'],
+        )
+
+        # Post comment to Bitrix timeline + notify responsible manager
+        if bitrix:
+            bitrix_comment = (
+                f"💳 Клієнт надіслав чек оплати рахунку {invoice_number}\n"
+                f"👤 {client['full_name']}\n"
+                f"📱 {client['phone']}\n"
+                f"📎 Чек: {drive_file['webViewLink']}\n\n"
+                f"⚠️ Перевірте оплату та змініть статус рахунку."
+            )
+            bitrix.add_timeline_comment(invoice_id, bitrix_comment)
+
+            notify_id = manager_bitrix_id or BITRIX_MANAGER_BITRIX_ID
+            if notify_id:
+                bitrix.notify_manager(
+                    notify_id,
+                    f"💳 Новий чек оплати!\n\n"
+                    f"Клієнт {client['full_name']} ({client['phone']}) "
+                    f"надіслав чек для рахунку {invoice_number}.\n\n"
+                    f"Перевірте та закрийте рахунок.\n"
+                    f"📎 {drive_file['webViewLink']}"
+                )
+
+        db.log_notification(
+            client_id=client['id'],
+            notification_type='receipt_submitted',
+            message=f"Надіслано чек для рахунку {invoice_number} (receipt_id={receipt_id})"
+        )
+        context.user_data.pop('uploading_receipt_for_invoice', None)
+
+        await loading_msg.delete()
+        await update.message.reply_text(
+            f"✅ <b>Чек надіслано!</b>\n\n"
+            f"Ваш чек для рахунку <b>{invoice_number}</b> передано менеджеру на перевірку.\n"
+            f"Після підтвердження оплати ви отримаєте повідомлення. 🎉",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💳 До рахунків", callback_data=CALLBACK_INVOICES)
+            ]])
+        )
+
+        # Notify Telegram admins
+        await notify_admins(
+            f"💳 <b>Клієнт надіслав чек оплати</b>\n\n"
+            f"👤 {client['full_name']}\n"
+            f"📱 {client['phone']}\n"
+            f"📄 Рахунок: {invoice_number}\n"
+            f"💰 Сума: {invoice_amount:,.2f} UAH\n"
+            f"📎 <a href=\"{drive_file['webViewLink']}\">Переглянути чек</a>"
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing receipt: {e}", exc_info=True)
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+        await update.message.reply_text("❌ Помилка при відправці чека. Спробуйте ще раз.")
+
+
+# ============================================================================
+# INVOICE BACKGROUND JOBS
+# ============================================================================
+
+async def check_invoice_payment_status(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic DB poll: if invoice stage changed to paid, notify clients with pending receipts."""
+    try:
+        pending_receipts = db.get_all_pending_receipts()
+        for receipt in pending_receipts:
+            try:
+                invoice = db.get_invoice_by_id(receipt['invoice_bitrix_id'])
+                if not invoice:
+                    continue
+                stage_id = invoice.get('stage_id') or ''
+                if BitrixClient.is_paid_stage(stage_id):
+                    db.update_receipt_status(receipt['id'], 'approved')
+                    if receipt.get('telegram_id'):
+                        await context.bot.send_message(
+                            chat_id=receipt['telegram_id'],
+                            text=(
+                                "✅ Ваш рахунок перевірили, дякуємо за оплату — "
+                                "ви ще на крок ближче до життя без боргів! 🎉💪"
+                            )
+                        )
+                        logger.info(f"Payment confirmed for receipt {receipt['id']}, client {receipt['telegram_id']}")
+            except Exception as e:
+                logger.error(f"Error checking receipt {receipt['id']}: {e}")
+    except Exception as e:
+        logger.error(f"Error in check_invoice_payment_status: {e}")
+
+
+async def check_invoice_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job: send payment reminders for upcoming and overdue invoices."""
+    try:
+        today = datetime.now(pytz.timezone('Europe/Kiev')).date()
+        tomorrow = today + timedelta(days=1)
+        invoices = db.get_unpaid_invoices_for_registered_clients()
+        for inv in invoices:
+            try:
+                invoice_date = inv.get('invoice_date')
+                if not invoice_date:
+                    continue
+                if hasattr(invoice_date, 'date'):
+                    due = invoice_date.date()
+                else:
+                    from datetime import date as _date
+                    due = _date.fromisoformat(str(invoice_date)[:10])
+
+                client_id = inv['client_db_id']
+                telegram_id = inv.get('telegram_id')
+                invoice_id = str(inv['id'])
+                title = inv.get('title') or f"Рахунок #{invoice_id}"
+                try:
+                    amount_str = f"{float(inv.get('amount') or 0):,.2f} UAH".replace(',', ' ')
+                except Exception:
+                    amount_str = f"{inv.get('amount', 0)} UAH"
+
+                if due == tomorrow:
+                    # Day-before reminder
+                    last = db.get_last_invoice_reminder(client_id, invoice_id)
+                    if last:
+                        sent = last['sent_at']
+                        if sent.tzinfo is None:
+                            sent = sent.replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - sent).days < 1:
+                            continue
+                    if telegram_id:
+                        await context.bot.send_message(
+                            chat_id=telegram_id,
+                            text=(
+                                f"⏰ <b>Нагадування про оплату рахунку</b>\n\n"
+                                f"📄 {title}\n"
+                                f"💰 Сума: {amount_str}\n"
+                                f"📅 Сплатити до: <b>{due.strftime('%d.%m.%Y')}</b>\n\n"
+                                f"Будь ласка, здійсніть оплату завтра і надішліть чек через кнопку «💳 Рахунки»."
+                            ),
+                            parse_mode='HTML'
+                        )
+                        db.log_invoice_reminder(client_id, invoice_id, 'day_before')
+                        logger.info(f"Day-before reminder sent to client {client_id} for invoice {invoice_id}")
+
+                elif due < today:
+                    # Overdue — weekly reminders
+                    last = db.get_last_invoice_reminder(client_id, invoice_id)
+                    if last:
+                        sent = last['sent_at']
+                        if sent.tzinfo is None:
+                            sent = sent.replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - sent).days < 7:
+                            continue
+                    if telegram_id:
+                        await context.bot.send_message(
+                            chat_id=telegram_id,
+                            text=(
+                                f"⚠️ <b>Рахунок прострочений</b>\n\n"
+                                f"📄 {title}\n"
+                                f"💰 Сума: {amount_str}\n"
+                                f"📅 Термін оплати: <b>{due.strftime('%d.%m.%Y')}</b>\n\n"
+                                f"Будь ласка, здійсніть оплату якнайшвидше та надішліть чек через «💳 Рахунки»."
+                            ),
+                            parse_mode='HTML'
+                        )
+                        db.log_invoice_reminder(client_id, invoice_id, 'overdue_weekly')
+                        logger.info(f"Overdue reminder sent to client {client_id} for invoice {invoice_id}")
+            except Exception as e:
+                logger.error(f"Error sending invoice reminder for invoice {inv.get('id')}: {e}")
+    except Exception as e:
+        logger.error(f"Error in check_invoice_reminders: {e}")
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -3092,6 +3807,10 @@ def main():
     application.add_handler(CommandHandler('register', admin_register))
     application.add_handler(CommandHandler('logout', admin_logout))
     application.add_handler(CommandHandler('info', info_command))
+    # Invoice callbacks (order matters: more specific patterns first)
+    application.add_handler(CallbackQueryHandler(handle_receipt_upload_request, pattern=f"^{CALLBACK_RECEIPT_PREFIX}"))
+    application.add_handler(CallbackQueryHandler(handle_invoice_detail, pattern=f"^{CALLBACK_INVOICE_PREFIX}"))
+    application.add_handler(CallbackQueryHandler(show_invoices, pattern=f"^{CALLBACK_INVOICES}$"))
     application.add_handler(CallbackQueryHandler(handle_upload_request, pattern=f"^{CALLBACK_UPLOAD_PREFIX}"))
     application.add_handler(CallbackQueryHandler(handle_done, pattern=f"^{CALLBACK_DONE}$"))
     application.add_handler(CallbackQueryHandler(handle_back, pattern=f"^{CALLBACK_BACK}$"))
@@ -3099,18 +3818,34 @@ def main():
         filters.TEXT & ~filters.COMMAND & filters.Regex("^📋"),
         lambda u, c: show_checklist(u, c)
     ))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex("^💳"),
+        show_invoices
+    ))
     # Обработчик текстовых сообщений (для пароля ЕЦП)
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & ~filters.Regex("^📋"),
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex("^(📋|💳)"),
         handle_text_message
     ))
 
-    # Створюємо таблицю для нагадувань (якщо не існує)
+    # Створюємо таблиці (якщо не існують)
     try:
         db.create_reminders_table()
         logger.info("Reminders table created/verified")
     except Exception as e:
         logger.error(f"Error creating reminders table: {e}")
+
+    try:
+        db.create_payment_receipts_table()
+        logger.info("Payment receipts table created/verified")
+    except Exception as e:
+        logger.error(f"Error creating payment_receipts table: {e}")
+
+    try:
+        db.create_invoice_reminders_table()
+        logger.info("Invoice reminders table created/verified")
+    except Exception as e:
+        logger.error(f"Error creating invoice_reminders table: {e}")
 
     # Налаштовуємо JobQueue для щоденної перевірки неактивних клієнтів
     job_queue = application.job_queue
@@ -3152,6 +3887,27 @@ def main():
         logger.info("Google Sheets sync job scheduled (every 4 hours)")
     except Exception as e:
         logger.warning(f"Google Sheets sync not configured: {e}")
+
+    # Poll DB every hour: check if invoice stage changed to paid and notify clients
+    job_queue.run_repeating(
+        check_invoice_payment_status,
+        interval=60 * 60,
+        first=60,
+        name="invoice_payment_status_check"
+    )
+    logger.info("Invoice payment status check job scheduled (every hour)")
+
+    # Daily reminders for upcoming/overdue invoice payments (10:00 Kyiv)
+    import datetime as dt
+    kyiv_tz = pytz.timezone('Europe/Kiev')
+    reminder_time = dt.time(hour=10, minute=0, tzinfo=kyiv_tz)
+    job_queue.run_daily(
+        check_invoice_reminders,
+        time=reminder_time,
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="invoice_reminder_check"
+    )
+    logger.info("Invoice reminder job scheduled for 10:00 Kyiv time")
 
     logger.info("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
