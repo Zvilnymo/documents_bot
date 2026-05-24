@@ -3336,6 +3336,8 @@ async def show_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg)
         return
 
+    chat_id = update.effective_chat.id
+
     if query:
         await query.answer()
         await query.edit_message_text("⏳ Завантажую рахунки...")
@@ -3354,11 +3356,20 @@ async def show_invoices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await loading_msg.edit_text(msg, reply_markup=reply_markup)
             return
 
-        # Генеруємо картинку-графік платежів
+        # Удаляем старую картинку если она есть
+        old_img_id = context.user_data.get('invoice_image_msg_id')
+        if old_img_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=old_img_id)
+            except Exception:
+                pass
+            context.user_data.pop('invoice_image_msg_id', None)
+
+        # Генеруємо і відправляємо нову картинку
         try:
             img_buf = generate_payment_schedule_image(invoices, client['full_name'])
-            chat_id = update.effective_chat.id
-            await context.bot.send_photo(chat_id=chat_id, photo=img_buf)
+            sent_img = await context.bot.send_photo(chat_id=chat_id, photo=img_buf)
+            context.user_data['invoice_image_msg_id'] = sent_img.message_id
         except Exception as img_err:
             logger.warning(f"Could not generate payment schedule image: {img_err}")
 
