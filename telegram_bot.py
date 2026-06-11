@@ -60,6 +60,18 @@ GOOGLE_OAUTH_TOKEN = os.getenv('GOOGLE_OAUTH_TOKEN')  # OAuth токен (JSON s
 # Settings
 REMINDER_DAYS = int(os.getenv('REMINDER_DAYS', 3))
 
+# Bitrix24 CRM
+BITRIX_WEBHOOK = os.getenv('BITRIX_WEBHOOK', '')
+BITRIX_PIPELINE_ID = 2
+BITRIX_STAGE_PLAN = 'C2:UC_BCGRYT'   # План затверджено судом
+BITRIX_STAGE_DEBT = 'C2:UC_YRXWP0'   # Списання боргів
+BITRIX_NEW_STAGES = {BITRIX_STAGE_PLAN, BITRIX_STAGE_DEBT}
+
+# Чат/юзери куди тегати при зверненні до менеджера (через пробіл, напр. "@user1 @user2")
+MANAGER_TAG = os.getenv('MANAGER_TAG', '')
+# ID чату для додаткового повідомлення (крім адмін-нотифікацій)
+MANAGER_CHAT_ID = os.getenv('MANAGER_CHAT_ID', '')
+
 # Підпапки на Drive
 SUBFOLDERS = {
     'credit': 'Кредитні договори',
@@ -532,6 +544,73 @@ class Database:
         """
         self.execute(query)
 
+    # -------------------------------------------------------------------------
+    # Post-plan / CRM stage tables
+    # -------------------------------------------------------------------------
+    def create_plan_tables(self):
+        """Таблиця платежів та нові колонки в clients для режиму після плану"""
+        # Нова таблиця для квитанцій
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS docbot.plan_payments (
+                id SERIAL PRIMARY KEY,
+                client_id INTEGER REFERENCES docbot.clients(id) ON DELETE CASCADE,
+                file_name VARCHAR(255),
+                file_url TEXT,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Нові колонки в clients (додаємо тільки якщо немає)
+        for col, definition in [
+            ('crm_stage',      'VARCHAR(50)'),
+            ('plan_file_id',   'VARCHAR(255)'),
+            ('plan_file_url',  'TEXT'),
+            ('plan_folder_id', 'VARCHAR(255)'),
+        ]:
+            try:
+                self.execute(
+                    f"ALTER TABLE docbot.clients ADD COLUMN IF NOT EXISTS {col} {definition}"
+                )
+            except Exception:
+                pass
+
+    def update_crm_stage(self, client_id, stage):
+        self.execute(
+            "UPDATE docbot.clients SET crm_stage = %s WHERE id = %s",
+            (stage, client_id)
+        )
+
+    def get_all_registered_clients(self):
+        """Всі клієнти з телефоном для перевірки CRM"""
+        return self.execute(
+            "SELECT id, telegram_id, full_name, phone, crm_stage FROM docbot.clients WHERE phone IS NOT NULL",
+            fetch=True
+        ) or []
+
+    def get_clients_by_crm_stage(self, stage):
+        """Клієнти на конкретній стадії CRM (для розсилки)"""
+        return self.execute(
+            "SELECT id, telegram_id, full_name FROM docbot.clients WHERE crm_stage = %s AND telegram_id IS NOT NULL",
+            (stage,), fetch=True
+        ) or []
+
+    def update_plan_file(self, client_id, file_id, file_url):
+        self.execute(
+            "UPDATE docbot.clients SET plan_file_id = %s, plan_file_url = %s WHERE id = %s",
+            (file_id, file_url, client_id)
+        )
+
+    def update_plan_folder(self, client_id, folder_id):
+        self.execute(
+            "UPDATE docbot.clients SET plan_folder_id = %s WHERE id = %s",
+            (folder_id, client_id)
+        )
+
+    def add_plan_payment(self, client_id, file_name, file_url):
+        self.execute(
+            "INSERT INTO docbot.plan_payments (client_id, file_name, file_url) VALUES (%s, %s, %s)",
+            (client_id, file_name, file_url)
+        )
+
     # Declarations
     def get_or_create_declaration(self, client_id, attempt=1):
         """Отримати існуючу декларацію або створити нову"""
@@ -736,6 +815,27 @@ class DriveManager:
         logger.info(f"Uploaded file: {filename}")
         return file
 
+    def upload_bytes(self, data: bytes, filename: str, folder_id: str, mimetype: str = 'application/octet-stream'):
+        """Завантаження файлу з байтів (для квитанцій/плану з Telegram)"""
+        file_metadata = {'name': filename, 'parents': [folder_id]}
+        media = MediaIoBaseUpload(BytesIO(data), mimetype=mimetype, resumable=True)
+        file = self.service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, name, webViewLink, size'
+        ).execute()
+        logger.info(f"Uploaded bytes: {filename}")
+        return file
+
+    def get_or_create_plan_folder(self, client_folder_id: str) -> str:
+        """Повертає ID папки 'Виконання плану' всередині папки клієнта"""
+        folder_name = 'Виконання плану'
+        existing = self.find_folder_by_name(folder_name, client_folder_id)
+        if existing:
+            return existing['id']
+        folder = self.create_folder(folder_name, parent_id=client_folder_id)
+        return folder['id']
+
     def create_text_file(self, content, filename, folder_id):
         file_metadata = {'name': filename, 'parents': [folder_id], 'mimeType': 'text/plain'}
 
@@ -796,6 +896,19 @@ CALLBACK_DECL_PREVIOUS = "decl_previous"
 CALLBACK_DECL_MENU = "decl_menu"
 CALLBACK_SCREENING_YES = "screening_yes"
 CALLBACK_SCREENING_NO = "screening_no"
+
+# Post-plan mode callbacks
+CALLBACK_MY_SCHEDULE = "my_schedule"
+CALLBACK_UPLOAD_RECEIPT = "upload_receipt"
+CALLBACK_FAQ = "faq"
+CALLBACK_FAQ_ITEM = "faq_item_"
+CALLBACK_CONTACT_MANAGER = "contact_manager"
+CALLBACK_ADMIN_UPLOAD_PLAN = "admin_upload_plan"
+
+# States for receipt upload and admin plan upload
+WAITING_RECEIPT = "waiting_receipt"
+ADMIN_PLAN_PHONE = "admin_plan_phone"
+ADMIN_PLAN_FILE = "admin_plan_file"
 
 SCREENING_QUESTIONS = [
     {
@@ -1089,6 +1202,579 @@ async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in check_and_send_reminders: {e}")
 
+# ============================================================================
+# BITRIX24 CRM INTEGRATION
+# ============================================================================
+
+import urllib.request as _urllib_request
+
+def _bitrix_post(method: str, payload: dict) -> dict:
+    """Синхронний POST до Bitrix24 REST API"""
+    if not BITRIX_WEBHOOK:
+        return {}
+    url = BITRIX_WEBHOOK.rstrip('/') + '/' + method
+    data = json.dumps(payload).encode('utf-8')
+    req = _urllib_request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    try:
+        with _urllib_request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        logger.error(f"Bitrix24 request error ({method}): {e}")
+        return {}
+
+def get_bitrix_contact_id_by_phone(phone: str) -> str | None:
+    """Повертає ID контакту в Bitrix24 по номеру телефону або None"""
+    normalized = ''.join(c for c in phone if c.isdigit() or c == '+')
+    result = _bitrix_post('crm.contact.list', {
+        'filter': {'PHONE': normalized},
+        'select': ['ID']
+    })
+    contacts = result.get('result', [])
+    if not contacts:
+        logger.info(f"Bitrix24: contact not found for phone {normalized} — saved to Drive only")
+        return None
+    return contacts[0]['ID']
+
+def get_crm_stage_by_phone(phone: str) -> str | None:
+    """Повертає STAGE_ID сделки у воронці BITRIX_PIPELINE_ID або None"""
+    contact_id = get_bitrix_contact_id_by_phone(phone)
+    if not contact_id:
+        return None
+    result = _bitrix_post('crm.deal.list', {
+        'filter': {'CONTACT_ID': contact_id, 'CATEGORY_ID': BITRIX_PIPELINE_ID},
+        'select': ['ID', 'STAGE_ID']
+    })
+    deals = result.get('result', [])
+    if not deals:
+        return None
+    return deals[0]['STAGE_ID']
+
+def update_bitrix_contact_fields(contact_id: str, fields: dict) -> bool:
+    """Оновлює поля контакту в Bitrix24. Повертає True при успіху."""
+    result = _bitrix_post('crm.contact.update', {
+        'id': contact_id,
+        'fields': fields
+    })
+    return bool(result.get('result'))
+
+def push_ecp_password_to_bitrix(phone: str, password: str) -> None:
+    """Записує пароль ЕЦП у поле контакту Bitrix24"""
+    contact_id = get_bitrix_contact_id_by_phone(phone)
+    if not contact_id:
+        return
+    ok = update_bitrix_contact_fields(contact_id, {
+        'UF_CRM_67825688AC9B5': password
+    })
+    if ok:
+        logger.info(f"ECP password pushed to Bitrix contact {contact_id}")
+    else:
+        logger.error(f"Failed to push ECP password to Bitrix contact {contact_id}")
+
+def push_ecp_file_to_bitrix(phone: str, filename: str, file_bytes: bytes) -> None:
+    """Завантажує файл ЕЦП у поле контакту Bitrix24 (base64)"""
+    import base64
+    contact_id = get_bitrix_contact_id_by_phone(phone)
+    if not contact_id:
+        return
+    encoded = base64.b64encode(file_bytes).decode('utf-8')
+    ok = update_bitrix_contact_fields(contact_id, {
+        'UF_CRM_664F2165402B5': {
+            'fileData': [filename, encoded]
+        }
+    })
+    if ok:
+        logger.info(f"ECP file pushed to Bitrix contact {contact_id}: {filename}")
+    else:
+        logger.error(f"Failed to push ECP file to Bitrix contact {contact_id}")
+
+# ============================================================================
+async def check_and_apply_crm_stage(client: dict, context) -> bool:
+    """
+    Перевіряє стадію клієнта в CRM і якщо вона нова — оновлює БД + відправляє вітання.
+    Повертає True якщо клієнт переведений у пост-план режим.
+    """
+    import asyncio
+    if not BITRIX_WEBHOOK or not client.get('phone'):
+        return False
+
+    # Виконуємо блокуючий запит у потоці щоб не гальмувати event loop
+    stage = await asyncio.to_thread(get_crm_stage_by_phone, client['phone'])
+
+    if stage not in BITRIX_NEW_STAGES:
+        return False
+
+    # Якщо стадія вже записана в БД — вітання вже надсилалось
+    if client.get('crm_stage') == stage:
+        return True
+
+    db.update_crm_stage(client['id'], stage)
+    logger.info(f"Client {client['full_name']} crm_stage set to {stage}")
+
+    welcome_text = WELCOME_PLAN if stage == BITRIX_STAGE_PLAN else WELCOME_DEBT
+    keyboard = get_post_plan_keyboard(stage)
+    await context.bot.send_message(
+        chat_id=client['telegram_id'],
+        text=welcome_text,
+        reply_markup=keyboard
+    )
+
+    stage_name = "План затверджено судом" if stage == BITRIX_STAGE_PLAN else "Списання боргів"
+    await notify_admins(
+        f"🔔 Клієнт переведений у новий режим\n\n"
+        f"👤 {client['full_name']}\n"
+        f"📱 {client['phone']}\n"
+        f"📋 Стадія: {stage_name}"
+    )
+    return True
+
+# POST-PLAN MODE: TEXT DATA
+# ============================================================================
+
+FAQ_PLAN = [
+    ("Чи можуть кредитори оскаржити рішення суду?",
+     "Так, кредитори мають 10 днів на оскарження судового рішення. У випадку, якщо вони звернуться до суду з апеляцією – ми продовжимо співпрацю та направимо заперечення на апеляційну скаргу."),
+    ("Чи можуть кредитори окремо звернутись до суду із позовною заявою про стягнення боргу?",
+     "Так, кредитори можуть звернутись до суду загальної юрисдикції, однак успіху там не матимуть. Якщо Ви отримаєте повідомлення про відкриття нової справи – зверніться до нас, ми допоможемо вирішити це питання."),
+    ("Що робити, якщо кредитори, які не заявили свої вимоги, досі турбують мене?",
+     "Повідомляємо, що все вирішуємо в судовому порядку. Направляємо їм ухвалу про затвердження плану реструктуризації."),
+    ("Як я можу отримати ухвалу суду з підписом та печаткою?",
+     "Ви можете звернутись безпосередньо до суду та отримати паперовий примірник ухвали, або зателефонувати в канцелярію та попросити надіслати ухвалу засобами поштового зв'язку."),
+    ("Як швидко з кредитної історії зникнуть борги та остаточно перестануть турбувати кредитори?",
+     "Після повного виконання плану. Зазвичай борги списуються та кредитна історія підчищається протягом 1-2 місяців. Якщо кредитори турбуватимуть надалі – направляйте їм ухвалу, блокуйте та звертайтесь до поліції."),
+]
+
+FAQ_DEBT = [
+    ("Чи можуть кредитори оскаржити рішення суду?",
+     "Так, кредитори мають 10 днів на оскарження судового рішення. У випадку, якщо вони звернуться до суду з апеляцією – ми продовжимо співпрацю та направимо заперечення на апеляційну скаргу."),
+    ("Чи можуть кредитори окремо звернутись до суду із позовною заявою про стягнення боргу?",
+     "Так, кредитори можуть звернутись до суду загальної юрисдикції, однак успіху там не матимуть. Якщо Ви отримаєте повідомлення про відкриття нової справи – зверніться до нас, ми допоможемо вирішити це питання."),
+    ("Що робити, якщо борги списано, однак виконавчі провадження не закриті та арешти не знято?",
+     "Якщо Ви бачите, що виконавець не закрив провадження та не зняв арешти, зверніться до нас – ми направимо документи і вирішимо питання із завершенням виконавчого провадження."),
+    ("Як я можу отримати ухвалу суду з підписом та печаткою?",
+     "Ви можете звернутись безпосередньо до суду та отримати паперовий примірник ухвали, або зателефонувати в канцелярію та попросити надіслати ухвалу засобами поштового зв'язку."),
+    ("Як швидко з кредитної історії зникнуть борги та остаточно перестануть турбувати кредитори?",
+     "Зазвичай борги списуються та кредитна історія підчищається протягом 1-2 місяців. Якщо кредитори турбуватимуть надалі – направляйте їм ухвалу, блокуйте та звертайтесь до поліції."),
+]
+
+WELCOME_PLAN = (
+    "🎉 Ми отримали ухвалу суду про затвердження плану реструктуризації для Вас. "
+    "Це означає, що позаду залишився непростий етап, а попереду — можливість розпочати нову сторінку життя без боргового тягаря. 💙\n\n"
+    "Та що ж далі? На зараз, Вам потрібно сплачувати лише кредиторам, визнаним в плані й жити спокійним життям. "
+    "Це дуже важливо, адже у разі невиконання плану суд може закрити провадження у справі, а боргові зобов'язання залишаються чинними. "
+    "Тому просимо Вас приділити цьому питанню особливу увагу. 💙\n\n"
+    "Додатково ми підготували Пам'ятку із відповідями на найпоширеніші питання по закінченню процедури та пропонуємо Вам з ними ознайомитись. "
+    "Давайте розберемося, які кроки варто зробити після завершення процедури та на що звернути увагу, щоб почуватися впевнено й спокійно. 😊\n\n"
+    "💙 Сподіваємося, що Ви знайшли відповіді на свої запитання. Але якщо щось залишилося незрозумілим або Вас цікавить додаткова інформація — не хвилюйтеся! "
+    "Ви завжди можете звернутися до юридичного відділу або на гарячу лінію. Наші фахівці із задоволенням допоможуть та дадуть відповіді на всі Ваші запитання. 📞🤝"
+)
+
+WELCOME_DEBT = (
+    "🎉 Ми отримали ухвалу суду про визнання Вас банкрутом та списання всіх боргів перед кредиторами. "
+    "Це означає, що позаду залишився непростий етап, а попереду — можливість розпочати нову сторінку життя без боргового тягаря. 💙\n\n"
+    "Та що ж далі? Чи справді всі питання вже вирішено, і можна повністю видихнути? "
+    "Ми підготували Пам'ятку із відповідями на найпоширеніші питання по закінченню процедури та пропонуємо Вам з ними ознайомитись. "
+    "Давайте розберемося, які кроки варто зробити після завершення процедури та на що звернути увагу, щоб почуватися впевнено й спокійно. 😊\n\n"
+    "💙 Сподіваємося, що Ви знайшли відповіді на свої запитання. Але якщо щось залишилося незрозумілим або Вас цікавить додаткова інформація — не хвилюйтеся! "
+    "Ви завжди можете звернутися до юридичного відділу або на гарячу лінію. Наші фахівці із задоволенням допоможуть та дадуть відповіді на всі Ваші запитання. 📞🤝"
+)
+
+MONTHLY_REMINDER_TEXT = (
+    "😊 Нагадуємо про важливість своєчасного виконання графіка платежів, передбаченого затвердженим планом реструктуризації. "
+    "Будемо вдячні, якщо Ви надішлете нам квитанцію про оплату платежів за поточний місяць. 📄\n\n"
+    "Якщо оплату вже здійснено — просто продублюйте квитанцію у відповідь на це повідомлення. "
+    "Якщо ж Ви ще не встигли провести платіж, будемо чекати на підтвердження оплати до кінця місяця. 🤝\n\n"
+    "Дякуємо за співпрацю та відповідальне ставлення до виконання плану реструктуризації! 🌷"
+)
+
+# ============================================================================
+# POST-PLAN MODE: MENU & HANDLERS
+# ============================================================================
+
+def get_post_plan_keyboard(stage: str) -> InlineKeyboardMarkup:
+    buttons = []
+    if stage == BITRIX_STAGE_PLAN:
+        buttons.append([InlineKeyboardButton("📅 Мій графік платежів", callback_data=CALLBACK_MY_SCHEDULE)])
+        buttons.append([InlineKeyboardButton("📤 Завантажити квитанцію", callback_data=CALLBACK_UPLOAD_RECEIPT)])
+    buttons.append([InlineKeyboardButton("❓ Поширені питання", callback_data=CALLBACK_FAQ)])
+    buttons.append([InlineKeyboardButton("📞 Зв'язатись із менеджером", callback_data=CALLBACK_CONTACT_MANAGER)])
+    return InlineKeyboardMarkup(buttons)
+
+async def show_post_plan_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, client: dict, welcome: bool = False):
+    """Показати меню пост-план режиму"""
+    stage = client.get('crm_stage', '')
+    text = (WELCOME_PLAN if stage == BITRIX_STAGE_PLAN else WELCOME_DEBT) if welcome else "Оберіть дію:"
+    keyboard = get_post_plan_keyboard(stage)
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+async def handle_my_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Мій графік платежів' — скидає файл плану з Drive"""
+    query = update.callback_query
+    await query.answer()
+    client, _ = get_active_client(update, context)
+    if not client:
+        await query.message.reply_text("❌ Клієнт не знайдений.")
+        return
+
+    file_id = client.get('plan_file_id')
+    file_url = client.get('plan_file_url')
+
+    if not file_id and not file_url:
+        await query.message.reply_text(
+            "📋 Графік платежів ще не завантажено.\n"
+            "Зверніться до менеджера — він додасть Ваш план найближчим часом."
+        )
+        return
+
+    try:
+        # Завантажуємо файл з Drive і відправляємо клієнту
+        file_data = drive.service.files().get_media(fileId=file_id).execute()
+        # Отримуємо метадані файлу
+        meta = drive.service.files().get(fileId=file_id, fields='name,mimeType').execute()
+        filename = meta.get('name', 'plan.pdf')
+        from telegram import InputFile
+        await query.message.reply_document(
+            document=InputFile(BytesIO(file_data), filename=filename),
+            caption="📅 Ваш графік платежів та реквізити"
+        )
+    except Exception as e:
+        logger.error(f"Error sending plan file: {e}")
+        if file_url:
+            await query.message.reply_text(
+                f"📅 Ваш графік платежів:\n{file_url}"
+            )
+        else:
+            await query.message.reply_text("❌ Помилка при отриманні файлу. Зверніться до менеджера.")
+
+async def handle_upload_receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Завантажити квитанцію'"""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['waiting_receipt'] = True
+    await query.message.reply_text(
+        "📤 Будь ласка, надішліть квитанцію про оплату (фото або файл).\n\n"
+        "Вона буде автоматично збережена до Вашої папки."
+    )
+
+async def handle_receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отримання квитанції від клієнта → Drive"""
+    if not context.user_data.get('waiting_receipt'):
+        return
+
+    client, _ = get_active_client(update, context)
+    if not client or not client.get('drive_folder_id'):
+        await update.message.reply_text("❌ Помилка: папка клієнта не знайдена.")
+        return
+
+    # Отримуємо файл або фото
+    tg_file = None
+    filename = None
+    mimetype = 'application/octet-stream'
+
+    if update.message.document:
+        doc = update.message.document
+        tg_file = await context.bot.get_file(doc.file_id)
+        filename = doc.file_name or f"receipt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        mimetype = doc.mime_type or mimetype
+    elif update.message.photo:
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
+        filename = f"receipt_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        mimetype = 'image/jpeg'
+    else:
+        await update.message.reply_text("⚠️ Надішліть файл або фото квитанції.")
+        return
+
+    await update.message.reply_text("⏳ Зберігаємо квитанцію...")
+
+    try:
+        # Отримуємо або створюємо папку "Виконання плану"
+        plan_folder_id = client.get('plan_folder_id')
+        if not plan_folder_id:
+            plan_folder_id = drive.get_or_create_plan_folder(client['drive_folder_id'])
+            db.update_plan_folder(client['id'], plan_folder_id)
+
+        # Завантажуємо файл
+        file_bytes = await tg_file.download_as_bytearray()
+        uploaded = drive.upload_bytes(bytes(file_bytes), filename, plan_folder_id, mimetype)
+        file_url = uploaded.get('webViewLink', '')
+
+        # Записуємо в БД
+        db.add_plan_payment(client['id'], filename, file_url)
+
+        context.user_data['waiting_receipt'] = False
+        await update.message.reply_text(
+            "✅ Квитанцію збережено!\n\n"
+            "Дякуємо за своєчасну оплату. Ми зафіксували Ваш платіж. 🌷",
+            reply_markup=get_post_plan_keyboard(client.get('crm_stage', ''))
+        )
+
+        # Повідомляємо адмінів
+        await notify_admins(
+            f"💳 Нова квитанція від клієнта\n\n"
+            f"👤 {client['full_name']}\n"
+            f"📱 {client['phone']}\n"
+            f"📄 Файл: {filename}\n"
+            f"🔗 {file_url}"
+        )
+
+    except Exception as e:
+        logger.error(f"Error uploading receipt: {e}")
+        await update.message.reply_text("❌ Помилка при збереженні квитанції. Спробуйте ще раз.")
+
+async def handle_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показати список FAQ"""
+    query = update.callback_query
+    await query.answer()
+    client, _ = get_active_client(update, context)
+    stage = client.get('crm_stage', '') if client else ''
+
+    faq_list = FAQ_PLAN if stage == BITRIX_STAGE_PLAN else FAQ_DEBT
+    buttons = [
+        [InlineKeyboardButton(f"{i+1}. {q}", callback_data=f"{CALLBACK_FAQ_ITEM}{i}")]
+        for i, (q, _) in enumerate(faq_list)
+    ]
+    buttons.append([InlineKeyboardButton("« Назад", callback_data="post_plan_back")])
+    await query.message.reply_text(
+        "❓ <b>Поширені питання</b>\n\nОберіть питання:",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def handle_faq_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показати відповідь на FAQ"""
+    query = update.callback_query
+    await query.answer()
+    client, _ = get_active_client(update, context)
+    stage = client.get('crm_stage', '') if client else ''
+
+    idx = int(query.data.replace(CALLBACK_FAQ_ITEM, ''))
+    faq_list = FAQ_PLAN if stage == BITRIX_STAGE_PLAN else FAQ_DEBT
+
+    if 0 <= idx < len(faq_list):
+        question, answer = faq_list[idx]
+        buttons = [[InlineKeyboardButton("« До питань", callback_data=CALLBACK_FAQ)]]
+        await query.message.reply_text(
+            f"❓ <b>{question}</b>\n\n{answer}",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+async def handle_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Зв'язатись із менеджером'"""
+    query = update.callback_query
+    await query.answer()
+    client, _ = get_active_client(update, context)
+
+    client_name = client['full_name'] if client else "Невідомий"
+    client_phone = client['phone'] if client else "—"
+    telegram_id = update.effective_user.id
+
+    # Логуємо звернення
+    if client:
+        db.log_notification(
+            client_id=client['id'],
+            notification_type='manager_request',
+            message='Клієнт запросив зв\'язок із менеджером'
+        )
+
+    # Текст повідомлення для адмінів
+    tag_line = f"\n{MANAGER_TAG}" if MANAGER_TAG else ""
+    admin_msg = (
+        f"📞 <b>Запит до менеджера</b>{tag_line}\n\n"
+        f"👤 {client_name}\n"
+        f"📱 {client_phone}\n"
+        f"🆔 Telegram ID: {telegram_id}"
+    )
+    await notify_admins(admin_msg)
+
+    # Додаткове повідомлення в окремий чат (якщо налаштовано)
+    if MANAGER_CHAT_ID and notification_bot:
+        try:
+            await notification_bot.send_message(
+                chat_id=int(MANAGER_CHAT_ID),
+                text=admin_msg,
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Failed to send to manager chat: {e}")
+
+    await query.message.reply_text(
+        "📞 Ваш запит передано менеджеру.\n\n"
+        "Наш спеціаліст зв'яжеться з Вами найближчим часом. 🤝"
+    )
+
+async def handle_post_plan_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Повернутись до головного меню пост-план режиму"""
+    query = update.callback_query
+    await query.answer()
+    client, _ = get_active_client(update, context)
+    if client:
+        await show_post_plan_menu(update, context, client)
+
+# ============================================================================
+# ADMIN: UPLOAD PLAN FILE FOR CLIENT
+# ============================================================================
+
+async def admin_upload_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /uploadplan — адмін завантажує план для клієнта"""
+    admin_id = update.effective_user.id
+    if admin_id not in load_admins():
+        await update.message.reply_text("❌ У вас немає доступу.")
+        return ConversationHandler.END
+
+    context.user_data['admin_upload_plan'] = {}
+    await update.message.reply_text(
+        "📋 <b>Завантаження плану реструктуризації для клієнта</b>\n\n"
+        "Введіть номер телефону клієнта (формат +380XXXXXXXXX):",
+        parse_mode='HTML'
+    )
+    return ADMIN_PLAN_PHONE
+
+async def admin_upload_plan_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = normalize_phone(update.message.text.strip())
+    client = db.get_client_by_phone(phone)
+    if not client:
+        await update.message.reply_text(f"❌ Клієнт з номером {phone} не знайдений. Спробуйте ще:")
+        return ADMIN_PLAN_PHONE
+
+    context.user_data['admin_upload_plan']['client_id'] = client['id']
+    context.user_data['admin_upload_plan']['client_name'] = client['full_name']
+    context.user_data['admin_upload_plan']['drive_folder_id'] = client.get('drive_folder_id')
+    await update.message.reply_text(
+        f"✅ Клієнт знайдений: <b>{client['full_name']}</b>\n\n"
+        f"Тепер надішліть файл плану реструктуризації (PDF або інший документ):",
+        parse_mode='HTML'
+    )
+    return ADMIN_PLAN_FILE
+
+async def admin_upload_plan_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        await update.message.reply_text("⚠️ Надішліть файл документа.")
+        return ADMIN_PLAN_FILE
+
+    data = context.user_data.get('admin_upload_plan', {})
+    client_id = data.get('client_id')
+    folder_id = data.get('drive_folder_id')
+
+    if not client_id or not folder_id:
+        await update.message.reply_text("❌ Помилка сесії. Почніть знову: /uploadplan")
+        return ConversationHandler.END
+
+    await update.message.reply_text("⏳ Завантажуємо файл на Google Drive...")
+    try:
+        doc = update.message.document
+        tg_file = await context.bot.get_file(doc.file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        filename = doc.file_name or f"plan_{client_id}.pdf"
+        mimetype = doc.mime_type or 'application/pdf'
+
+        uploaded = drive.upload_bytes(bytes(file_bytes), filename, folder_id, mimetype)
+        file_drive_id = uploaded.get('id', '')
+        file_url = uploaded.get('webViewLink', '')
+
+        db.update_plan_file(client_id, file_drive_id, file_url)
+
+        await update.message.reply_text(
+            f"✅ Файл <b>{filename}</b> успішно завантажено для клієнта <b>{data['client_name']}</b>.\n\n"
+            f"🔗 {file_url}",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Error uploading plan: {e}")
+        await update.message.reply_text(f"❌ Помилка: {e}")
+
+    context.user_data.pop('admin_upload_plan', None)
+    return ConversationHandler.END
+
+async def admin_upload_plan_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('admin_upload_plan', None)
+    await update.message.reply_text("❌ Скасовано.")
+    return ConversationHandler.END
+
+# ============================================================================
+# CRM DAILY CHECK JOB
+# ============================================================================
+
+async def check_crm_stages(context: ContextTypes.DEFAULT_TYPE):
+    """Щоденна перевірка стадій CRM для всіх клієнтів"""
+    if not BITRIX_WEBHOOK:
+        logger.warning("BITRIX_WEBHOOK not set, skipping CRM check")
+        return
+
+    logger.info("Starting daily CRM stage check...")
+    clients = db.get_all_registered_clients()
+
+    for client in clients:
+        try:
+            if not client.get('phone'):
+                continue
+
+            new_stage = get_crm_stage_by_phone(client['phone'])
+
+            if new_stage not in BITRIX_NEW_STAGES:
+                continue
+
+            # Вже на цій стадії — пропускаємо
+            if client.get('crm_stage') == new_stage:
+                continue
+
+            # Оновлюємо стадію в БД
+            db.update_crm_stage(client['id'], new_stage)
+            logger.info(f"Client {client['full_name']} moved to stage {new_stage}")
+
+            # Відправляємо вітальне повідомлення
+            if client.get('telegram_id'):
+                welcome_text = WELCOME_PLAN if new_stage == BITRIX_STAGE_PLAN else WELCOME_DEBT
+                keyboard = get_post_plan_keyboard(new_stage)
+                await context.bot.send_message(
+                    chat_id=client['telegram_id'],
+                    text=welcome_text,
+                    reply_markup=keyboard
+                )
+
+            # Повідомляємо адмінів
+            stage_name = "План затверджено судом" if new_stage == BITRIX_STAGE_PLAN else "Списання боргів"
+            await notify_admins(
+                f"🔔 Клієнт перейшов на нову стадію\n\n"
+                f"👤 {client['full_name']}\n"
+                f"📱 {client['phone']}\n"
+                f"📋 Стадія: {stage_name}"
+            )
+
+        except Exception as e:
+            logger.error(f"CRM check error for client {client.get('id')}: {e}")
+
+    logger.info("CRM stage check completed")
+
+# ============================================================================
+# MONTHLY PAYMENT REMINDER JOB
+# ============================================================================
+
+async def send_monthly_plan_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Розсилка 20-го числа клієнтам на стадії 'План затверджено судом'"""
+    logger.info("Starting monthly plan payment reminder...")
+    clients = db.get_clients_by_crm_stage(BITRIX_STAGE_PLAN)
+
+    for client in clients:
+        try:
+            await context.bot.send_message(
+                chat_id=client['telegram_id'],
+                text=MONTHLY_REMINDER_TEXT
+            )
+            db.log_notification(
+                client_id=client['id'],
+                notification_type='monthly_plan_reminder',
+                message='Щомісячне нагадування про оплату за планом'
+            )
+            logger.info(f"Monthly reminder sent to {client['full_name']}")
+        except Exception as e:
+            logger.error(f"Monthly reminder error for client {client.get('id')}: {e}")
+
+    logger.info(f"Monthly reminder sent to {len(clients)} clients")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"User {user.id} started bot")
@@ -1121,6 +1807,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Звичайна реєстрація клієнта
     client = db.get_client_by_telegram_id(user.id)
     if client:
+        # Якщо crm_stage вже є — одразу пост-план меню
+        if client.get('crm_stage') in BITRIX_NEW_STAGES:
+            await show_post_plan_menu(update, context, client)
+            return ConversationHandler.END
+
+        # Тихий CRM-чек для тих хто ще не на новій стадії
+        switched = await check_and_apply_crm_stage(client, context)
+        if switched:
+            return ConversationHandler.END
+
         await update.message.reply_text(
             f"Вітаю знову, {client['full_name']}! 👋\n\n"
             f"Ви вже зареєстровані в системі.\n"
@@ -1215,6 +1911,12 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['client_id'] = client['id']
     context.user_data['screening_answers'] = {}
+
+    # Тихий CRM-чек одразу після реєстрації
+    # Якщо клієнт вже на потрібній стадії — переключаємо режим і завершуємо реєстрацію
+    switched = await check_and_apply_crm_stage(client, context)
+    if switched:
+        return ConversationHandler.END
 
     await update.message.reply_text(
         f"👤 {full_name}, дякуємо!\n\n"
@@ -1537,6 +2239,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             drive.create_text_file(password, 'Пароль_ЕЦП.txt', personal_folder_id)
             logger.info(f"ECP password file created on Drive for client_id={client['id']}")
 
+            # Пушимо пароль у Bitrix24
+            import asyncio
+            asyncio.get_event_loop().run_in_executor(
+                None, push_ecp_password_to_bitrix, client['phone'], password
+            )
+
             db.update_last_activity(client['id'])
 
             # Логируем в notifications_log
@@ -1749,6 +2457,18 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             file_size=int(drive_file.get('size', 0)),
             uploaded_by_admin_id=admin_id
         )
+
+        # Якщо це ЕЦП — пушимо файл у Bitrix24 у фоні
+        if doc_key == 'ecp':
+            try:
+                import asyncio
+                with open(temp_path, 'rb') as _f:
+                    _ecp_bytes = _f.read()
+                asyncio.get_event_loop().run_in_executor(
+                    None, push_ecp_file_to_bitrix, client['phone'], new_file_name, _ecp_bytes
+                )
+            except Exception as _e:
+                logger.error(f"ECP file Bitrix push error: {_e}")
 
         # Зберігаємо результат AI-валідації (якщо є)
         if validation_result:
@@ -3092,6 +3812,27 @@ def main():
     application.add_handler(CommandHandler('register', admin_register))
     application.add_handler(CommandHandler('logout', admin_logout))
     application.add_handler(CommandHandler('info', info_command))
+
+    # Admin: upload plan (ConversationHandler)
+    admin_plan_handler = ConversationHandler(
+        entry_points=[CommandHandler('uploadplan', admin_upload_plan_start)],
+        states={
+            ADMIN_PLAN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_upload_plan_phone)],
+            ADMIN_PLAN_FILE: [MessageHandler(filters.Document.ALL, admin_upload_plan_file)],
+        },
+        fallbacks=[CommandHandler('cancel', admin_upload_plan_cancel)],
+        allow_reentry=True
+    )
+    application.add_handler(admin_plan_handler)
+
+    # Post-plan mode callbacks
+    application.add_handler(CallbackQueryHandler(handle_my_schedule, pattern=f"^{CALLBACK_MY_SCHEDULE}$"))
+    application.add_handler(CallbackQueryHandler(handle_upload_receipt_start, pattern=f"^{CALLBACK_UPLOAD_RECEIPT}$"))
+    application.add_handler(CallbackQueryHandler(handle_faq, pattern=f"^{CALLBACK_FAQ}$"))
+    application.add_handler(CallbackQueryHandler(handle_faq_item, pattern=f"^{CALLBACK_FAQ_ITEM}"))
+    application.add_handler(CallbackQueryHandler(handle_contact_manager, pattern=f"^{CALLBACK_CONTACT_MANAGER}$"))
+    application.add_handler(CallbackQueryHandler(handle_post_plan_back, pattern="^post_plan_back$"))
+
     application.add_handler(CallbackQueryHandler(handle_upload_request, pattern=f"^{CALLBACK_UPLOAD_PREFIX}"))
     application.add_handler(CallbackQueryHandler(handle_done, pattern=f"^{CALLBACK_DONE}$"))
     application.add_handler(CallbackQueryHandler(handle_back, pattern=f"^{CALLBACK_BACK}$"))
@@ -3099,42 +3840,72 @@ def main():
         filters.TEXT & ~filters.COMMAND & filters.Regex("^📋"),
         lambda u, c: show_checklist(u, c)
     ))
+    # Файли/фото — спочатку перевіряємо чи клієнт чекає квитанцію
+    application.add_handler(MessageHandler(
+        (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
+        handle_receipt_file
+    ))
     # Обработчик текстовых сообщений (для пароля ЕЦП)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.Regex("^📋"),
         handle_text_message
     ))
 
-    # Створюємо таблицю для нагадувань (якщо не існує)
+    # Створюємо таблиці (якщо не існують)
     try:
         db.create_reminders_table()
         logger.info("Reminders table created/verified")
     except Exception as e:
         logger.error(f"Error creating reminders table: {e}")
 
-    # Налаштовуємо JobQueue для щоденної перевірки неактивних клієнтів
-    job_queue = application.job_queue
+    try:
+        db.create_plan_tables()
+        logger.info("Plan tables created/verified")
+    except Exception as e:
+        logger.error(f"Error creating plan tables: {e}")
 
-    # Запускаємо перевірку щодня о 14:03 за київським часом
+    # Налаштовуємо JobQueue
+    job_queue = application.job_queue
     import datetime as dt
     kyiv_tz = pytz.timezone('Europe/Kiev')
-    check_time = dt.time(hour=14, minute=23, tzinfo=kyiv_tz)
 
+    # Щоденна перевірка неактивних клієнтів о 14:23
     job_queue.run_daily(
         check_and_send_reminders,
-        time=check_time,
-        days=(0, 1, 2, 3, 4, 5, 6),  # Всі дні тижня
+        time=dt.time(hour=14, minute=23, tzinfo=kyiv_tz),
+        days=(0, 1, 2, 3, 4, 5, 6),
         name="daily_reminder_check"
     )
+    logger.info("Daily reminder job scheduled for 14:23 Kyiv time")
 
-    logger.info("Daily reminder job scheduled for 14:03 Kyiv time")
+    # Щоденна перевірка стадій CRM о 10:00
+    job_queue.run_daily(
+        check_crm_stages,
+        time=dt.time(hour=10, minute=0, tzinfo=kyiv_tz),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="daily_crm_check"
+    )
+    logger.info("Daily CRM stage check scheduled for 10:00 Kyiv time")
+
+    # Щомісячне нагадування 20-го числа о 10:00
+    # run_monthly не існує в PTB, тому перевіряємо день всередині щоденного job
+    async def monthly_reminder_wrapper(ctx):
+        if dt.datetime.now(kyiv_tz).day == 20:
+            await send_monthly_plan_reminder(ctx)
+
+    job_queue.run_daily(
+        monthly_reminder_wrapper,
+        time=dt.time(hour=10, minute=0, tzinfo=kyiv_tz),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="monthly_plan_reminder"
+    )
+    logger.info("Monthly plan reminder scheduled (fires on 20th)")
 
     # Google Sheets sync job (кожні 4 години)
     try:
         from sync_to_sheets import sync_to_sheets
 
         async def sheets_sync_job(context):
-            """Фонова задача синхронізації з Google Sheets"""
             try:
                 logger.info("Starting Google Sheets sync...")
                 sync_to_sheets()
@@ -3142,11 +3913,10 @@ def main():
             except Exception as e:
                 logger.error(f"Google Sheets sync error: {e}")
 
-        # Запускаємо синхронізацію кожні 4 години
         job_queue.run_repeating(
             sheets_sync_job,
-            interval=4 * 60 * 60,  # 4 години в секундах
-            first=60,  # Перший запуск через 1 хвилину після старту
+            interval=4 * 60 * 60,
+            first=60,
             name="google_sheets_sync"
         )
         logger.info("Google Sheets sync job scheduled (every 4 hours)")
