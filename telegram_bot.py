@@ -1712,7 +1712,8 @@ async def check_crm_stages(context: ContextTypes.DEFAULT_TYPE):
             if not client.get('phone'):
                 continue
 
-            new_stage = get_crm_stage_by_phone(client['phone'])
+            import asyncio
+            new_stage = await asyncio.to_thread(get_crm_stage_by_phone, client['phone'])
 
             if new_stage not in BITRIX_NEW_STAGES:
                 continue
@@ -2213,6 +2214,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Ви ще не зареєстровані. Натисніть /start")
         return
 
+    # Пост-план клієнт — показуємо його меню
+    if client.get('crm_stage') in BITRIX_NEW_STAGES:
+        await show_post_plan_menu(update, context, client)
+        return
+
     if 'uploading_doc_type' not in context.user_data:
         await update.message.reply_text(
             "⚠️ Спочатку виберіть тип документа через кнопку \"📋 Чек-лист\"",
@@ -2294,6 +2300,11 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not client:
         await update.message.reply_text("❌ Ви ще не зареєстровані. Натисніть /start")
+        return
+
+    # Пост-план клієнт чекає квитанцію — перенаправляємо
+    if context.user_data.get('waiting_receipt') and client.get('crm_stage') in BITRIX_NEW_STAGES:
+        await handle_receipt_file(update, context)
         return
 
     if 'uploading_doc_type' not in context.user_data:
@@ -3839,11 +3850,6 @@ def main():
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex("^📋"),
         lambda u, c: show_checklist(u, c)
-    ))
-    # Файли/фото — спочатку перевіряємо чи клієнт чекає квитанцію
-    application.add_handler(MessageHandler(
-        (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
-        handle_receipt_file
     ))
     # Обработчик текстовых сообщений (для пароля ЕЦП)
     application.add_handler(MessageHandler(
