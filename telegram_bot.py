@@ -71,6 +71,8 @@ BITRIX_NEW_STAGES = {BITRIX_STAGE_PLAN, BITRIX_STAGE_DEBT}
 MANAGER_TAG = os.getenv('MANAGER_TAG', '')
 # ID чату для додаткового повідомлення (крім адмін-нотифікацій)
 MANAGER_CHAT_ID = os.getenv('MANAGER_CHAT_ID', '')
+# ID групового чату для нотифікацій про план
+PLAN_NOTIFICATION_CHAT_ID = int(os.getenv('PLAN_NOTIFICATION_CHAT_ID', '-1003928840124'))
 
 # Підпапки на Drive
 SUBFOLDERS = {
@@ -93,6 +95,14 @@ DOCUMENT_TYPES = {
         'folder': 'personal',
         'required': True,
         'is_text': True
+    },
+    'emailpass': {
+        'name': 'Пошта та пароль',
+        'short': 'Пошта та пароль',
+        'emoji': '📧',
+        'folder': 'personal',
+        'required': False,
+        'is_text_email': True
     },
     'ecp': {
         'name': 'ЕЦП (електронний цифровий підпис)',
@@ -1082,6 +1092,21 @@ async def notify_admins(message, parse_mode='HTML'):
         except Exception as e:
             logger.error(f"Failed to notify admin {admin_id}: {e}")
 
+async def notify_plan_chat(message, parse_mode='HTML'):
+    """Відправити нотифікацію в груповий чат плану"""
+    if not notification_bot:
+        return
+    try:
+        await notification_bot.send_message(
+            chat_id=PLAN_NOTIFICATION_CHAT_ID,
+            text=message,
+            parse_mode=parse_mode,
+            disable_web_page_preview=True
+        )
+        logger.info(f"Plan notification sent to chat {PLAN_NOTIFICATION_CHAT_ID}")
+    except Exception as e:
+        logger.error(f"Failed to notify plan chat {PLAN_NOTIFICATION_CHAT_ID}: {e}")
+
 async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Перевірка неактивних клієнтів та відправка нагадувань
 
@@ -1287,6 +1312,21 @@ def push_ecp_file_to_bitrix(phone: str, filename: str, file_bytes: bytes) -> Non
     else:
         logger.error(f"Failed to push ECP file to Bitrix contact {contact_id}")
 
+def push_email_to_bitrix(phone: str, email: str, password: str) -> None:
+    """Записує email і пароль пошти у поля контакту Bitrix24, а також у базове поле EMAIL"""
+    contact_id = get_bitrix_contact_id_by_phone(phone)
+    if not contact_id:
+        return
+    ok = update_bitrix_contact_fields(contact_id, {
+        'UF_CRM_1707350058': email,
+        'UF_CRM_1749543593334': password,
+        'EMAIL': [{'VALUE': email, 'VALUE_TYPE': 'WORK'}]
+    })
+    if ok:
+        logger.info(f"Email+password pushed to Bitrix contact {contact_id}")
+    else:
+        logger.error(f"Failed to push email+password to Bitrix contact {contact_id}")
+
 # ============================================================================
 async def check_and_apply_crm_stage(client: dict, context) -> bool:
     """
@@ -1319,12 +1359,14 @@ async def check_and_apply_crm_stage(client: dict, context) -> bool:
     )
 
     stage_name = "План затверджено судом" if stage == BITRIX_STAGE_PLAN else "Списання боргів"
-    await notify_admins(
+    notif_text = (
         f"🔔 Клієнт переведений у новий режим\n\n"
         f"👤 {client['full_name']}\n"
         f"📱 {client['phone']}\n"
         f"📋 Стадія: {stage_name}"
     )
+    await notify_admins(notif_text)
+    await notify_plan_chat(notif_text)
     return True
 
 # POST-PLAN MODE: TEXT DATA
@@ -1511,14 +1553,16 @@ async def handle_receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=get_post_plan_keyboard(client.get('crm_stage', ''))
         )
 
-        # Повідомляємо адмінів
-        await notify_admins(
+        # Повідомляємо адмінів та груповий чат
+        receipt_notif = (
             f"💳 Нова квитанція від клієнта\n\n"
             f"👤 {client['full_name']}\n"
             f"📱 {client['phone']}\n"
             f"📄 Файл: {filename}\n"
             f"🔗 {file_url}"
         )
+        await notify_admins(receipt_notif)
+        await notify_plan_chat(receipt_notif)
 
     except Exception as e:
         logger.error(f"Error uploading receipt: {e}")
@@ -1621,7 +1665,8 @@ async def handle_post_plan_back(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_upload_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /uploadplan — адмін завантажує план для клієнта"""
     admin_id = update.effective_user.id
-    if admin_id not in load_admins():
+    chat_id = update.effective_chat.id
+    if admin_id not in load_admins() and chat_id != PLAN_NOTIFICATION_CHAT_ID:
         await update.message.reply_text("❌ У вас немає доступу.")
         return ConversationHandler.END
 
@@ -1682,6 +1727,12 @@ async def admin_upload_plan_file(update: Update, context: ContextTypes.DEFAULT_T
             f"🔗 {file_url}",
             parse_mode='HTML'
         )
+        await notify_plan_chat(
+            f"📋 Завантажено план реструктуризації\n\n"
+            f"👤 {data['client_name']}\n"
+            f"📄 Файл: {filename}\n"
+            f"🔗 {file_url}"
+        )
     except Exception as e:
         logger.error(f"Error uploading plan: {e}")
         await update.message.reply_text(f"❌ Помилка: {e}")
@@ -1736,14 +1787,16 @@ async def check_crm_stages(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=keyboard
                 )
 
-            # Повідомляємо адмінів
+            # Повідомляємо адмінів та груповий чат
             stage_name = "План затверджено судом" if new_stage == BITRIX_STAGE_PLAN else "Списання боргів"
-            await notify_admins(
+            crm_notif = (
                 f"🔔 Клієнт перейшов на нову стадію\n\n"
                 f"👤 {client['full_name']}\n"
                 f"📱 {client['phone']}\n"
                 f"📋 Стадія: {stage_name}"
             )
+            await notify_admins(crm_notif)
+            await notify_plan_chat(crm_notif)
 
         except Exception as e:
             logger.error(f"CRM check error for client {client.get('id')}: {e}")
@@ -1774,6 +1827,9 @@ async def send_monthly_plan_reminder(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Monthly reminder error for client {client.get('id')}: {e}")
 
+    await notify_plan_chat(
+        f"📅 Щомісячне нагадування про оплату надіслано {len(clients)} клієнтам (план реструктуризації)"
+    )
     logger.info(f"Monthly reminder sent to {len(clients)} clients")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2170,6 +2226,16 @@ async def handle_upload_request(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardButton("« Назад", callback_data=CALLBACK_BACK)
             ]])
         )
+    elif doc_info.get('is_text_email'):
+        context.user_data['emailpass_step'] = 'email'
+        await query.edit_message_text(
+            f"📧 <b>{doc_info['name']}</b>\n\n"
+            f"Введіть вашу електронну пошту (email):",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Назад", callback_data=CALLBACK_BACK)
+            ]])
+        )
     else:
         # Используем description если есть, иначе name
         doc_title = doc_info.get('description', doc_info['name'])
@@ -2288,6 +2354,71 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"❌ Помилка збереження пароля: {str(e)}")
 
         return
+
+    elif doc_info.get('is_text_email'):
+        import asyncio
+        step = context.user_data.get('emailpass_step', 'email')
+
+        if step == 'email':
+            email = update.message.text.strip()
+            if '@' not in email or '.' not in email.split('@')[-1]:
+                await update.message.reply_text(
+                    "⚠️ Невірний формат email. Введіть коректну адресу (наприклад: name@gmail.com):"
+                )
+                return
+            context.user_data['emailpass_email'] = email
+            context.user_data['emailpass_step'] = 'password'
+            await update.message.reply_text(
+                f"✅ Email прийнято: {email}\n\nТепер введіть пароль від цієї пошти:"
+            )
+            return
+
+        elif step == 'password':
+            email = context.user_data.get('emailpass_email', '')
+            password = update.message.text.strip()
+
+            try:
+                folders = drive.create_client_folder_structure(client['full_name'], client['phone'])
+                personal_folder_id = folders['personal']['id']
+                file_content = f"Email: {email}\nПароль: {password}"
+                drive.create_text_file(file_content, 'Пошта_та_пароль.txt', personal_folder_id)
+
+                # Пушимо в Bitrix24
+                asyncio.get_event_loop().run_in_executor(
+                    None, push_email_to_bitrix, client['phone'], email, password
+                )
+
+                db.update_last_activity(client['id'])
+                db.log_notification(
+                    client_id=client['id'],
+                    notification_type='email_password_saved',
+                    message=f"Пошта та пароль збережено: {email}"
+                )
+
+                # Очищаємо стан
+                context.user_data.pop('uploading_doc_type', None)
+                context.user_data.pop('uploaded_files', None)
+                context.user_data.pop('emailpass_step', None)
+                context.user_data.pop('emailpass_email', None)
+
+                await update.message.reply_text("✅ Пошта та пароль збережено!")
+
+                await notify_admins(
+                    f"📧 Клієнт зберіг пошту та пароль\n\n"
+                    f"👤 {client['full_name']}\n"
+                    f"📱 {client['phone']}\n"
+                    f"📧 Email: {email}\n"
+                    f"📁 <a href=\"{client['drive_folder_url']}\">Відкрити папку на Drive</a>"
+                )
+
+                await asyncio.sleep(0.5)
+                await show_checklist(update, context, force_new_message=True)
+
+            except Exception as e:
+                logger.error(f"Error saving email+password: {e}", exc_info=True)
+                await update.message.reply_text(f"❌ Помилка збереження: {str(e)}")
+            return
+
     else:
         # Если выбран не текстовый тип документа, а пользователь отправил текст
         await update.message.reply_text(
@@ -3731,6 +3862,18 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
+async def test_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /testnotify — тестове повідомлення в груповий чат плану"""
+    admin_id = update.effective_user.id
+    if admin_id not in load_admins():
+        await update.message.reply_text("❌ У вас немає доступу.")
+        return
+    await notify_plan_chat(
+        f"✅ Тест нотифікацій\n\nПовідомлення успішно доставлено в чат плану.\n"
+        f"🤖 Відправив: {update.effective_user.full_name}"
+    )
+    await update.message.reply_text(f"✅ Тестове повідомлення надіслано в чат {PLAN_NOTIFICATION_CHAT_ID}")
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -3823,6 +3966,7 @@ def main():
     application.add_handler(CommandHandler('register', admin_register))
     application.add_handler(CommandHandler('logout', admin_logout))
     application.add_handler(CommandHandler('info', info_command))
+    application.add_handler(CommandHandler('testnotify', test_notify_command))
 
     # Admin: upload plan (ConversationHandler)
     admin_plan_handler = ConversationHandler(
