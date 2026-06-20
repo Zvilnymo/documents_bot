@@ -61,7 +61,13 @@ GOOGLE_OAUTH_TOKEN = os.getenv('GOOGLE_OAUTH_TOKEN')  # OAuth токен (JSON s
 REMINDER_DAYS = int(os.getenv('REMINDER_DAYS', 3))
 
 # Bitrix24 CRM
-BITRIX_WEBHOOK = os.getenv('BITRIX_WEBHOOK', '')
+_b24_domain = os.getenv('B24_DOMAIN', '')
+_b24_user_id = os.getenv('B24_USER_ID', '')
+_b24_token = os.getenv('B24_TOKEN_DEALS', '')
+BITRIX_WEBHOOK = os.getenv(
+    'BITRIX_WEBHOOK',
+    f'https://{_b24_domain}/rest/{_b24_user_id}/{_b24_token}/' if _b24_domain else ''
+)
 BITRIX_PIPELINE_ID = 2
 BITRIX_STAGE_PLAN = 'C2:UC_BCGRYT'   # План затверджено судом
 BITRIX_STAGE_DEBT = 'C2:UC_YRXWP0'   # Списання боргів
@@ -1247,32 +1253,51 @@ def _bitrix_post(method: str, payload: dict) -> dict:
         logger.error(f"Bitrix24 request error ({method}): {e}")
         return {}
 
-def get_bitrix_contact_id_by_phone(phone: str) -> str | None:
-    """Повертає ID контакту в Bitrix24 по номеру телефону або None"""
+def get_bitrix_contact_ids_by_phone(phone: str) -> list:
+    """Повертає всі ID контактів у Bitrix24 для номера телефону (враховує дублікати)"""
     normalized = ''.join(c for c in phone if c.isdigit() or c == '+')
-    result = _bitrix_post('crm.contact.list', {
-        'filter': {'PHONE': normalized},
-        'select': ['ID']
-    })
-    contacts = result.get('result', [])
-    if not contacts:
-        logger.info(f"Bitrix24: contact not found for phone {normalized} — saved to Drive only")
-        return None
-    return contacts[0]['ID']
+    digits_only = normalized.lstrip('+')
+
+    logger.info(f"Bitrix24: searching contacts by phone: {normalized}")
+
+    seen = set()
+    contact_ids = []
+    for variant in [normalized, digits_only]:
+        result = _bitrix_post('crm.contact.list', {
+            'filter': {'PHONE': variant},
+            'select': ['ID']
+        })
+        for c in result.get('result', []):
+            if c['ID'] not in seen:
+                seen.add(c['ID'])
+                contact_ids.append(c['ID'])
+
+    logger.info(f"Bitrix24: contacts for phone {normalized}: {contact_ids}")
+    return contact_ids
+
+def get_bitrix_contact_id_by_phone(phone: str) -> str | None:
+    """Повертає перший знайдений ID контакту або None"""
+    ids = get_bitrix_contact_ids_by_phone(phone)
+    return ids[0] if ids else None
 
 def get_crm_stage_by_phone(phone: str) -> str | None:
     """Повертає STAGE_ID сделки у воронці BITRIX_PIPELINE_ID або None"""
-    contact_id = get_bitrix_contact_id_by_phone(phone)
-    if not contact_id:
+    contact_ids = get_bitrix_contact_ids_by_phone(phone)
+    if not contact_ids:
         return None
-    result = _bitrix_post('crm.deal.list', {
-        'filter': {'CONTACT_ID': contact_id, 'CATEGORY_ID': BITRIX_PIPELINE_ID},
-        'select': ['ID', 'STAGE_ID']
-    })
-    deals = result.get('result', [])
-    if not deals:
-        return None
-    return deals[0]['STAGE_ID']
+    for contact_id in contact_ids:
+        result = _bitrix_post('crm.deal.list', {
+            'filter': {'CONTACT_ID': contact_id, 'CATEGORY_ID': BITRIX_PIPELINE_ID},
+            'select': ['ID', 'STAGE_ID']
+        })
+        deals = result.get('result', [])
+        logger.info(f"Bitrix24: deals for contact {contact_id} (pipeline {BITRIX_PIPELINE_ID}): {deals}")
+        if deals:
+            stage = deals[0]['STAGE_ID']
+            logger.info(f"Bitrix24: stage for phone {phone} = {stage!r} (expected one of {BITRIX_NEW_STAGES})")
+            return stage
+    logger.warning(f"Bitrix24: no deals in pipeline {BITRIX_PIPELINE_ID} for phone {phone}")
+    return None
 
 def update_bitrix_contact_fields(contact_id: str, fields: dict) -> bool:
     """Оновлює поля контакту в Bitrix24. Повертає True при успіху."""
@@ -3882,50 +3907,6 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
-async def _admin_set_stage(update: Update, context: ContextTypes.DEFAULT_TYPE, stage: str):
-    """Спільна логіка для /setplan і /setdebt"""
-    admin_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    if admin_id not in load_admins() and chat_id != PLAN_NOTIFICATION_CHAT_ID:
-        await update.message.reply_text("❌ У вас немає доступу.")
-        return
-
-    if not context.args:
-        stage_name = "план" if stage == BITRIX_STAGE_PLAN else "списання боргів"
-        await update.message.reply_text(f"Використання: /{'setplan' if stage == BITRIX_STAGE_PLAN else 'setdebt'} +380XXXXXXXXX\n\nПереводить клієнта в режим «{stage_name}».")
-        return
-
-    phone = normalize_phone(context.args[0])
-    client = db.get_client_by_phone(phone)
-    if not client:
-        await update.message.reply_text(f"❌ Клієнт з номером {phone} не знайдений.")
-        return
-
-    db.update_crm_stage(client['id'], stage)
-    stage_label = "План затверджено судом" if stage == BITRIX_STAGE_PLAN else "Списання боргів"
-    await update.message.reply_text(f"✅ Клієнту <b>{client['full_name']}</b> встановлено стадію: {stage_label}", parse_mode='HTML')
-
-    if client.get('telegram_id'):
-        welcome_text = WELCOME_PLAN if stage == BITRIX_STAGE_PLAN else WELCOME_DEBT
-        keyboard = get_post_plan_keyboard(stage)
-        try:
-            await context.bot.send_message(
-                chat_id=client['telegram_id'],
-                text=welcome_text,
-                reply_markup=keyboard
-            )
-        except Exception as e:
-            logger.error(f"Failed to send post-plan welcome to client {client['id']}: {e}")
-            await update.message.reply_text("⚠️ Стадію збережено, але не вдалось надіслати повідомлення клієнту.")
-
-async def admin_set_plan_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /setplan +380XXXXXXXXX — переводить клієнта в режим плану"""
-    await _admin_set_stage(update, context, BITRIX_STAGE_PLAN)
-
-async def admin_set_debt_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /setdebt +380XXXXXXXXX — переводить клієнта в режим списання боргів"""
-    await _admin_set_stage(update, context, BITRIX_STAGE_DEBT)
-
 async def test_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /testnotify — тестове повідомлення в груповий чат плану"""
     admin_id = update.effective_user.id
@@ -4031,8 +4012,6 @@ def main():
     application.add_handler(CommandHandler('logout', admin_logout))
     application.add_handler(CommandHandler('info', info_command))
     application.add_handler(CommandHandler('testnotify', test_notify_command))
-    application.add_handler(CommandHandler('setplan', admin_set_plan_stage))
-    application.add_handler(CommandHandler('setdebt', admin_set_debt_stage))
 
     # Admin: upload plan (ConversationHandler)
     admin_plan_handler = ConversationHandler(
