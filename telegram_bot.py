@@ -1951,8 +1951,14 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client = db.create_client(update.effective_user.id, full_name, phone)
     except Exception as e:
         logger.error(f"Failed to create client in DB: {e}")
-        # Можливо клієнт вже існує з іншим telegram_id — шукаємо по телефону
+        # Телефон вже є в БД з іншим telegram_id — переприв'язуємо до поточного юзера
         client = db.get_client_by_phone(phone)
+        if client:
+            db.execute(
+                "UPDATE docbot.clients SET telegram_id = %s, full_name = %s, last_activity = CURRENT_TIMESTAMP WHERE id = %s",
+                (update.effective_user.id, full_name, client['id'])
+            )
+            client = db.get_client_by_id(client['id'])
         if not client:
             await update.message.reply_text(
                 "❌ Помилка реєстрації. Спробуйте пізніше або зв'яжіться з менеджером."
