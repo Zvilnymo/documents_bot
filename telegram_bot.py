@@ -3987,7 +3987,7 @@ def main():
     additional_docs_handler = ConversationHandler(
         entry_points=[
             MessageHandler(
-                (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
+                (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND & filters.ChatType.PRIVATE,
                 handle_file_upload
             )
         ],
