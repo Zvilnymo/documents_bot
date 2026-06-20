@@ -3882,6 +3882,50 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message, parse_mode='HTML', disable_web_page_preview=True)
 
+async def _admin_set_stage(update: Update, context: ContextTypes.DEFAULT_TYPE, stage: str):
+    """Спільна логіка для /setplan і /setdebt"""
+    admin_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if admin_id not in load_admins() and chat_id != PLAN_NOTIFICATION_CHAT_ID:
+        await update.message.reply_text("❌ У вас немає доступу.")
+        return
+
+    if not context.args:
+        stage_name = "план" if stage == BITRIX_STAGE_PLAN else "списання боргів"
+        await update.message.reply_text(f"Використання: /{'setplan' if stage == BITRIX_STAGE_PLAN else 'setdebt'} +380XXXXXXXXX\n\nПереводить клієнта в режим «{stage_name}».")
+        return
+
+    phone = normalize_phone(context.args[0])
+    client = db.get_client_by_phone(phone)
+    if not client:
+        await update.message.reply_text(f"❌ Клієнт з номером {phone} не знайдений.")
+        return
+
+    db.update_crm_stage(client['id'], stage)
+    stage_label = "План затверджено судом" if stage == BITRIX_STAGE_PLAN else "Списання боргів"
+    await update.message.reply_text(f"✅ Клієнту <b>{client['full_name']}</b> встановлено стадію: {stage_label}", parse_mode='HTML')
+
+    if client.get('telegram_id'):
+        welcome_text = WELCOME_PLAN if stage == BITRIX_STAGE_PLAN else WELCOME_DEBT
+        keyboard = get_post_plan_keyboard(stage)
+        try:
+            await context.bot.send_message(
+                chat_id=client['telegram_id'],
+                text=welcome_text,
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"Failed to send post-plan welcome to client {client['id']}: {e}")
+            await update.message.reply_text("⚠️ Стадію збережено, але не вдалось надіслати повідомлення клієнту.")
+
+async def admin_set_plan_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /setplan +380XXXXXXXXX — переводить клієнта в режим плану"""
+    await _admin_set_stage(update, context, BITRIX_STAGE_PLAN)
+
+async def admin_set_debt_stage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /setdebt +380XXXXXXXXX — переводить клієнта в режим списання боргів"""
+    await _admin_set_stage(update, context, BITRIX_STAGE_DEBT)
+
 async def test_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /testnotify — тестове повідомлення в груповий чат плану"""
     admin_id = update.effective_user.id
@@ -3987,6 +4031,8 @@ def main():
     application.add_handler(CommandHandler('logout', admin_logout))
     application.add_handler(CommandHandler('info', info_command))
     application.add_handler(CommandHandler('testnotify', test_notify_command))
+    application.add_handler(CommandHandler('setplan', admin_set_plan_stage))
+    application.add_handler(CommandHandler('setdebt', admin_set_debt_stage))
 
     # Admin: upload plan (ConversationHandler)
     admin_plan_handler = ConversationHandler(
