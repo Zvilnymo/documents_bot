@@ -1946,14 +1946,24 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['phone'] = phone
     full_name = context.user_data['full_name']
-    client = db.create_client(update.effective_user.id, full_name, phone)
+
+    try:
+        client = db.create_client(update.effective_user.id, full_name, phone)
+    except Exception as e:
+        logger.error(f"Failed to create client in DB: {e}")
+        # Можливо клієнт вже існує з іншим telegram_id — шукаємо по телефону
+        client = db.get_client_by_phone(phone)
+        if not client:
+            await update.message.reply_text(
+                "❌ Помилка реєстрації. Спробуйте пізніше або зв'яжіться з менеджером."
+            )
+            return ConversationHandler.END
 
     try:
         folders = drive.create_client_folder_structure(full_name, phone)
         db.update_client_drive_folder(client['id'], folders['client']['id'], folders['client']['webViewLink'])
         context.user_data['folders'] = folders
 
-        # Логируем регистрацию клиента
         db.log_notification(
             client_id=client['id'],
             notification_type='client_registered',
@@ -1970,8 +1980,12 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['screening_answers'] = {}
 
     # Тихий CRM-чек одразу після реєстрації
-    # Якщо клієнт вже на потрібній стадії — переключаємо режим і завершуємо реєстрацію
-    switched = await check_and_apply_crm_stage(client, context)
+    try:
+        switched = await check_and_apply_crm_stage(client, context)
+    except Exception as e:
+        logger.error(f"CRM check error during registration: {e}")
+        switched = False
+
     if switched:
         return ConversationHandler.END
 
@@ -4072,6 +4086,11 @@ def main():
         logger.info("Google Sheets sync job scheduled (every 4 hours)")
     except Exception as e:
         logger.warning(f"Google Sheets sync not configured: {e}")
+
+    async def error_handler(_update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Unhandled exception in PTB handler", exc_info=context.error)
+
+    application.add_error_handler(error_handler)
 
     logger.info("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
