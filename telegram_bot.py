@@ -844,12 +844,12 @@ class DriveManager:
         return file
 
     def get_or_create_plan_folder(self, client_folder_id: str) -> str:
-        """Повертає ID папки 'Виконання плану' всередині папки клієнта"""
-        folder_name = 'Виконання плану'
-        existing = self.find_folder_by_name(folder_name, client_folder_id)
-        if existing:
-            return existing['id']
-        folder = self.create_folder(folder_name, parent_id=client_folder_id)
+        """Повертає ID папки 'Квитанції' всередині папки клієнта"""
+        for folder_name in ['Квитанції', 'Виконання плану']:
+            existing = self.find_folder_by_name(folder_name, client_folder_id)
+            if existing:
+                return existing['id']
+        folder = self.create_folder('Квитанції', parent_id=client_folder_id)
         return folder['id']
 
     def create_text_file(self, content, filename, folder_id):
@@ -1472,7 +1472,10 @@ async def show_post_plan_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (WELCOME_PLAN if stage == BITRIX_STAGE_PLAN else WELCOME_DEBT) if welcome else "Оберіть дію:"
     keyboard = get_post_plan_keyboard(stage)
     if update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=keyboard)
+        try:
+            await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+        except Exception:
+            await update.callback_query.message.reply_text(text, reply_markup=keyboard)
     else:
         await update.message.reply_text(text, reply_markup=keyboard)
 
@@ -1489,41 +1492,56 @@ async def handle_my_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_url = client.get('plan_file_url')
 
     if not file_id and not file_url:
-        await query.message.reply_text(
-            "📋 Графік платежів ще не завантажено.\n"
-            "Зверніться до менеджера — він додасть Ваш план найближчим часом."
-        )
+        try:
+            await query.message.edit_text(
+                "📋 Графік платежів ще не завантажено.\n"
+                "Зверніться до менеджера — він додасть Ваш план найближчим часом.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="post_plan_back")]])
+            )
+        except Exception:
+            await query.message.reply_text(
+                "📋 Графік платежів ще не завантажено.\n"
+                "Зверніться до менеджера — він додасть Ваш план найближчим часом."
+            )
         return
 
     try:
-        # Завантажуємо файл з Drive і відправляємо клієнту
+        await query.message.edit_text("⏳ Завантажуємо файл...")
         file_data = drive.service.files().get_media(fileId=file_id).execute()
-        # Отримуємо метадані файлу
         meta = drive.service.files().get(fileId=file_id, fields='name,mimeType').execute()
         filename = meta.get('name', 'plan.pdf')
         from telegram import InputFile
         await query.message.reply_document(
             document=InputFile(BytesIO(file_data), filename=filename),
-            caption="📅 Ваш графік платежів та реквізити"
+            caption="📅 Ваш графік платежів та реквізити",
+            reply_markup=get_post_plan_keyboard(client.get('crm_stage', ''))
         )
+        await query.message.delete()
     except Exception as e:
         logger.error(f"Error sending plan file: {e}")
         if file_url:
             await query.message.reply_text(
-                f"📅 Ваш графік платежів:\n{file_url}"
+                f"📅 Ваш графік платежів:\n{file_url}",
+                reply_markup=get_post_plan_keyboard(client.get('crm_stage', ''))
             )
         else:
-            await query.message.reply_text("❌ Помилка при отриманні файлу. Зверніться до менеджера.")
+            await query.message.reply_text(
+                "❌ Помилка при отриманні файлу. Зверніться до менеджера.",
+                reply_markup=get_post_plan_keyboard(client.get('crm_stage', ''))
+            )
 
 async def handle_upload_receipt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка 'Завантажити квитанцію'"""
     query = update.callback_query
     await query.answer()
     context.user_data['waiting_receipt'] = True
-    await query.message.reply_text(
-        "📤 Будь ласка, надішліть квитанцію про оплату (фото або файл).\n\n"
-        "Вона буде автоматично збережена до Вашої папки."
-    )
+    text = "📤 Будь ласка, надішліть квитанцію про оплату (фото або файл).\n\nВона буде автоматично збережена до Вашої папки."
+    try:
+        await query.message.edit_text(text)
+        context.user_data['receipt_instruction_msg_id'] = query.message.message_id
+    except Exception:
+        msg = await query.message.reply_text(text)
+        context.user_data['receipt_instruction_msg_id'] = msg.message_id
 
 async def handle_receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отримання квитанції від клієнта → Drive"""
@@ -1557,7 +1575,7 @@ async def handle_receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("⏳ Зберігаємо квитанцію...")
 
     try:
-        # Отримуємо або створюємо папку "Виконання плану"
+        # Отримуємо або створюємо папку "Квитанції"
         plan_folder_id = client.get('plan_folder_id')
         if not plan_folder_id:
             plan_folder_id = drive.get_or_create_plan_folder(client['drive_folder_id'])
@@ -1572,6 +1590,7 @@ async def handle_receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         db.add_plan_payment(client['id'], filename, file_url)
 
         context.user_data['waiting_receipt'] = False
+        context.user_data.pop('receipt_instruction_msg_id', None)
         await update.message.reply_text(
             "✅ Квитанцію збережено!\n\n"
             "Дякуємо за своєчасну оплату. Ми зафіксували Ваш платіж. 🌷",
@@ -1606,11 +1625,18 @@ async def handle_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, (q, _) in enumerate(faq_list)
     ]
     buttons.append([InlineKeyboardButton("« Назад", callback_data="post_plan_back")])
-    await query.message.reply_text(
-        "❓ <b>Поширені питання</b>\n\nОберіть питання:",
-        parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    try:
+        await query.message.edit_text(
+            "❓ <b>Поширені питання</b>\n\nОберіть питання:",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    except Exception:
+        await query.message.reply_text(
+            "❓ <b>Поширені питання</b>\n\nОберіть питання:",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
 
 async def handle_faq_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показати відповідь на FAQ"""
@@ -1625,55 +1651,33 @@ async def handle_faq_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 0 <= idx < len(faq_list):
         question, answer = faq_list[idx]
         buttons = [[InlineKeyboardButton("« До питань", callback_data=CALLBACK_FAQ)]]
-        await query.message.reply_text(
-            f"❓ <b>{question}</b>\n\n{answer}",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        try:
+            await query.message.edit_text(
+                f"❓ <b>{question}</b>\n\n{answer}",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception:
+            await query.message.reply_text(
+                f"❓ <b>{question}</b>\n\n{answer}",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
 
 async def handle_contact_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Кнопка 'Зв'язатись із менеджером'"""
+    """Кнопка 'Зв'язатись із менеджером' — крок 1: просимо написати питання"""
     query = update.callback_query
     await query.answer()
     client, _ = get_active_client(update, context)
 
-    client_name = client['full_name'] if client else "Невідомий"
-    client_phone = client['phone'] if client else "—"
-    telegram_id = update.effective_user.id
+    context.user_data['waiting_manager_message'] = True
+    context.user_data['manager_client'] = client
 
-    # Логуємо звернення
-    if client:
-        db.log_notification(
-            client_id=client['id'],
-            notification_type='manager_request',
-            message='Клієнт запросив зв\'язок із менеджером'
-        )
-
-    # Текст повідомлення для адмінів
-    tag_line = f"\n{MANAGER_TAG}" if MANAGER_TAG else ""
-    admin_msg = (
-        f"📞 <b>Запит до менеджера</b>{tag_line}\n\n"
-        f"👤 {client_name}\n"
-        f"📱 {client_phone}\n"
-        f"🆔 Telegram ID: {telegram_id}"
-    )
-    await notify_admins(admin_msg)
-
-    # Додаткове повідомлення в окремий чат (якщо налаштовано)
-    if MANAGER_CHAT_ID and notification_bot:
-        try:
-            await notification_bot.send_message(
-                chat_id=int(MANAGER_CHAT_ID),
-                text=admin_msg,
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.error(f"Failed to send to manager chat: {e}")
-
-    await query.message.reply_text(
-        "📞 Ваш запит передано менеджеру.\n\n"
-        "Наш спеціаліст зв'яжеться з Вами найближчим часом. 🤝"
-    )
+    text = "✍️ Напишіть Ваше питання або повідомлення для менеджера:"
+    try:
+        await query.message.edit_text(text)
+    except Exception:
+        await query.message.reply_text(text)
 
 async def handle_post_plan_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Повернутись до головного меню пост-план режиму"""
@@ -1741,7 +1745,8 @@ async def admin_upload_plan_file(update: Update, context: ContextTypes.DEFAULT_T
         filename = doc.file_name or f"plan_{client_id}.pdf"
         mimetype = doc.mime_type or 'application/pdf'
 
-        uploaded = drive.upload_bytes(bytes(file_bytes), filename, folder_id, mimetype)
+        plan_subfolder_id = drive.get_or_create_folder('План', folder_id)
+        uploaded = drive.upload_bytes(bytes(file_bytes), filename, plan_subfolder_id, mimetype)
         file_drive_id = uploaded.get('id', '')
         file_url = uploaded.get('webViewLink', '')
 
@@ -2323,6 +2328,32 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not client:
         await update.message.reply_text("❌ Ви ще не зареєстровані. Натисніть /start")
+        return
+
+    # Клієнт написав повідомлення для менеджера — крок 2
+    if context.user_data.get('waiting_manager_message'):
+        context.user_data.pop('waiting_manager_message', None)
+        manager_client = context.user_data.pop('manager_client', client)
+        client_name = manager_client['full_name'] if manager_client else client['full_name']
+        client_phone = manager_client['phone'] if manager_client else client['phone']
+        user_message = update.message.text.strip()
+
+        tag_line = f"\n{MANAGER_TAG}" if MANAGER_TAG else ""
+        notif = (
+            f"📞 <b>Запит до менеджера</b>{tag_line}\n\n"
+            f"👤 {client_name}\n"
+            f"📱 {client_phone}\n\n"
+            f"💬 {user_message}"
+        )
+        await notify_plan_chat(notif)
+
+        if client:
+            db.log_notification(client_id=client['id'], notification_type='manager_request', message=user_message)
+
+        await update.message.reply_text(
+            "📞 Ваш запит передано менеджеру.\n\nНаш спеціаліст зв'яжеться з Вами найближчим часом. 🤝",
+            reply_markup=get_post_plan_keyboard(client.get('crm_stage', '') if client else '')
+        )
         return
 
     # Пост-план клієнт — показуємо його меню
